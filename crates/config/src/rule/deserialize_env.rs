@@ -1,8 +1,9 @@
 use super::referent_rule::{GlobalRules, ReferentRuleError, RuleRegistration};
+use crate::check_var::CheckHint;
 use crate::maybe::Maybe;
 use crate::rule::{self, Rule, RuleSerializeError, SerializableRule};
-use crate::rule_config::RuleConfigError;
-use crate::rule_core::SerializableRuleCore;
+use crate::rule_core::{RuleCoreError, SerializableRuleCore};
+use crate::transform::Transformation;
 
 use ast_grep_core::language::Language;
 
@@ -30,7 +31,7 @@ fn into_map<L: Language>(
     .collect()
 }
 
-type OrderResult<T> = Result<T, ReferentRuleError>;
+type OrderResult<T> = Result<T, String>;
 
 /// A struct to store information to deserialize rules.
 pub struct DeserializeEnv<L: Language> {
@@ -41,76 +42,78 @@ pub struct DeserializeEnv<L: Language> {
 }
 
 trait DependentRule: Sized {
-  fn visit_dependent_rules<'a>(&'a self, sorter: &mut TopologicalSort<'a, Self>)
-    -> OrderResult<()>;
+  fn visit_dependency<'a>(&'a self, sorter: &mut TopologicalSort<'a, Self>) -> OrderResult<()>;
 }
 
 impl DependentRule for SerializableRule {
-  fn visit_dependent_rules<'a>(
-    &'a self,
-    sorter: &mut TopologicalSort<'a, Self>,
-  ) -> OrderResult<()> {
+  fn visit_dependency<'a>(&'a self, sorter: &mut TopologicalSort<'a, Self>) -> OrderResult<()> {
     visit_dependent_rule_ids(self, sorter)
   }
 }
 
 impl<L: Language> DependentRule for (L, SerializableRuleCore) {
-  fn visit_dependent_rules<'a>(
-    &'a self,
-    sorter: &mut TopologicalSort<'a, Self>,
-  ) -> OrderResult<()> {
+  fn visit_dependency<'a>(&'a self, sorter: &mut TopologicalSort<'a, Self>) -> OrderResult<()> {
     visit_dependent_rule_ids(&self.1.rule, sorter)
   }
 }
 
+impl DependentRule for Transformation {
+  fn visit_dependency<'a>(&'a self, sorter: &mut TopologicalSort<'a, Self>) -> OrderResult<()> {
+    let used_var = self.used_vars();
+    sorter.visit(used_var)
+  }
+}
+
 /// A struct to topological sort rules
-/// it is used to report cyclic dependency errors in rules
+/// it is used to report cyclic dependency errors in rules/transformation
 struct TopologicalSort<'a, T: DependentRule> {
-  utils: &'a HashMap<String, T>,
-  order: Vec<&'a String>,
+  maps: &'a HashMap<String, T>,
+  order: Vec<&'a str>,
   // bool stands for if the rule has completed visit
-  seen: HashMap<&'a String, bool>,
+  seen: HashMap<&'a str, bool>,
 }
 
 impl<'a, T: DependentRule> TopologicalSort<'a, T> {
-  fn get_order(utils: &HashMap<String, T>) -> OrderResult<Vec<&String>> {
-    let mut top_sort = TopologicalSort::new(utils);
-    for rule_id in utils.keys() {
-      top_sort.visit(rule_id)?;
+  fn get_order(maps: &HashMap<String, T>) -> OrderResult<Vec<&str>> {
+    let mut top_sort = TopologicalSort::new(maps);
+    for key in maps.keys() {
+      top_sort.visit(key)?;
     }
     Ok(top_sort.order)
   }
 
-  fn new(utils: &'a HashMap<String, T>) -> Self {
+  fn new(maps: &'a HashMap<String, T>) -> Self {
     Self {
-      utils,
+      maps,
       order: vec![],
       seen: HashMap::new(),
     }
   }
 
-  fn visit(&mut self, rule_id: &'a String) -> OrderResult<()> {
-    if let Some(&completed) = self.seen.get(rule_id) {
+  fn visit(&mut self, key: &'a str) -> OrderResult<()> {
+    if let Some(&completed) = self.seen.get(key) {
       // if the rule has been seen but not completed
       // it means we have a cyclic dependency and report an error here
       return if completed {
         Ok(())
       } else {
-        Err(ReferentRuleError::CyclicRule)
+        Err(key.to_string())
       };
     }
-    let Some(rule) = self.utils.get(rule_id) else {
+    let Some(item) = self.maps.get(key) else {
+      // key can be found elsewhere
+      // e.g. if key is rule_id
       // if rule_id not found in global, it can be a local rule
       // if rule_id not found in local, it can be a global rule
       // TODO: add check here and return Err if rule not found
       return Ok(());
     };
     // mark the id as seen but not completed
-    self.seen.insert(rule_id, false);
-    rule.visit_dependent_rules(self)?;
+    self.seen.insert(key, false);
+    item.visit_dependency(self)?;
     // mark the id as seen and completed
-    self.seen.insert(rule_id, true);
-    self.order.push(rule_id);
+    self.seen.insert(key, true);
+    self.order.push(key);
     Ok(())
   }
 }
@@ -133,8 +136,8 @@ fn visit_dependent_rule_ids<'a, T: DependentRule>(
       visit_dependent_rule_ids(sub, sort)?;
     }
   }
-  if let Maybe::Present(_not) = &rule.not {
-    // TODO: check cyclic here
+  if let Maybe::Present(not) = &rule.not {
+    visit_dependent_rule_ids(not, sort)?;
   }
   Ok(())
 }
@@ -154,7 +157,9 @@ impl<L: Language> DeserializeEnv<L> {
     self,
     utils: &HashMap<String, SerializableRule>,
   ) -> Result<Self, RuleSerializeError> {
-    let order = TopologicalSort::get_order(utils)?;
+    let order = TopologicalSort::get_order(utils)
+      .map_err(ReferentRuleError::CyclicRule)
+      .map_err(RuleSerializeError::MatchesReference)?;
     for id in order {
       let rule = utils.get(id).expect("must exist");
       let rule = self.deserialize_rule(rule.clone())?;
@@ -166,14 +171,16 @@ impl<L: Language> DeserializeEnv<L> {
   /// register global utils rule discovered in the config.
   pub fn parse_global_utils(
     utils: Vec<SerializableGlobalRule<L>>,
-  ) -> Result<GlobalRules<L>, RuleConfigError> {
+  ) -> Result<GlobalRules<L>, RuleCoreError> {
     let registration = GlobalRules::default();
     let utils = into_map(utils);
-    let order = TopologicalSort::get_order(&utils).map_err(RuleSerializeError::from)?;
+    let order = TopologicalSort::get_order(&utils)
+      .map_err(ReferentRuleError::CyclicRule)
+      .map_err(RuleSerializeError::from)?;
     for id in order {
       let (lang, core) = utils.get(id).expect("must exist");
       let env = DeserializeEnv::new(lang.clone()).with_globals(&registration);
-      let matcher = core.get_matcher(env)?;
+      let matcher = core.get_matcher_with_hint(env, CheckHint::Global)?;
       registration
         .insert(id, matcher)
         .map_err(RuleSerializeError::MatchesReference)?;
@@ -186,6 +193,13 @@ impl<L: Language> DeserializeEnv<L> {
     serialized: SerializableRule,
   ) -> Result<Rule<L>, RuleSerializeError> {
     rule::deserialize_rule(serialized, self)
+  }
+
+  pub(crate) fn get_transform_order<'a>(
+    &self,
+    trans: &'a HashMap<String, Transformation>,
+  ) -> Result<Vec<&'a str>, String> {
+    TopologicalSort::get_order(trans)
   }
 
   pub fn with_globals(self, globals: &GlobalRules<L>) -> Self {
@@ -289,6 +303,25 @@ local-rule-c:
     )?;
     let ret = DeserializeEnv::new(TypeScript::Tsx).register_local_utils(&utils);
     assert!(ret.is_err());
+    Ok(())
+  }
+
+  #[test]
+  fn test_cyclic_not() -> Result<()> {
+    let utils = from_str(
+      "
+local-rule-a:
+  not: {matches: local-rule-b}
+local-rule-b:
+  matches: local-rule-a",
+    )?;
+    let ret = DeserializeEnv::new(TypeScript::Tsx).register_local_utils(&utils);
+    assert!(matches!(
+      ret,
+      Err(RuleSerializeError::MatchesReference(
+        ReferentRuleError::CyclicRule(_)
+      ))
+    ));
     Ok(())
   }
 }

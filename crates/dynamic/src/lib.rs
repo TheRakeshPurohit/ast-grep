@@ -10,12 +10,17 @@ use tree_sitter_native::{Language as NativeTS, LANGUAGE_VERSION, MIN_COMPATIBLE_
 use std::borrow::Cow;
 use std::fs::canonicalize;
 use std::path::{Path, PathBuf};
+use std::ptr::{addr_of, addr_of_mut};
 use std::str::FromStr;
+
+mod custom_lang;
+
+pub use custom_lang::CustomLang;
 
 type LangIndex = u32;
 
 /// Represents a tree-sitter language loaded as dynamic lib.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct DynamicLang {
   index: LangIndex,
   // inline expando char since it is used frequently
@@ -36,7 +41,7 @@ impl DynamicLang {
   pub fn file_types(&self) -> Types {
     let mut builder = TypesBuilder::new();
     let inner = self.inner();
-    let mapping = unsafe { &LANG_INDEX };
+    let mapping = unsafe { &*addr_of!(LANG_INDEX) };
     for (ext, i) in mapping.iter() {
       if *i == self.index {
         builder
@@ -156,8 +161,8 @@ impl DynamicLang {
     for reg in regs {
       Self::register_one(reg, &mut langs, &mut mapping)?;
     }
-    _ = std::mem::replace(&mut DYNAMIC_LANG, langs);
-    _ = std::mem::replace(&mut LANG_INDEX, mapping);
+    _ = std::mem::replace(&mut *addr_of_mut!(DYNAMIC_LANG), langs);
+    _ = std::mem::replace(&mut *addr_of_mut!(LANG_INDEX), mapping);
     Ok(())
   }
 
@@ -194,7 +199,7 @@ impl DynamicLang {
   }
 
   fn langs() -> &'static Vec<Inner> {
-    unsafe { &DYNAMIC_LANG }
+    unsafe { &*addr_of!(DYNAMIC_LANG) }
   }
 }
 
@@ -206,7 +211,7 @@ impl Language for DynamicLang {
 
   fn from_path<P: AsRef<Path>>(path: P) -> Option<Self> {
     let ext = path.as_ref().extension()?.to_str()?;
-    let mapping = unsafe { &LANG_INDEX };
+    let mapping = unsafe { &*addr_of!(LANG_INDEX) };
     let langs = Self::langs();
     mapping.iter().find_map(|(p, idx)| {
       if p == ext {
@@ -255,18 +260,25 @@ impl Language for DynamicLang {
 mod test {
   use super::*;
 
-  #[cfg(target_os = "macos")]
+  // currently we only have json parser for these platforms
+  // apple silicon macos and linux x86_64
   fn get_tree_sitter_path() -> &'static str {
-    "../../benches/fixtures/json-mac.so"
-  }
-  #[cfg(target_os = "linux")]
-  fn get_tree_sitter_path() -> &'static str {
-    "../../benches/fixtures/json-linux.so"
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+      "../../benches/fixtures/json-mac.so"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+      "../../benches/fixtures/json-linux.so"
+    } else {
+      ""
+    }
   }
 
   #[test]
   fn test_load_parser() {
     let path = get_tree_sitter_path();
+    // skip unsupported platform
+    if path.is_empty() {
+      return;
+    }
     let (_lib, lang) = unsafe { load_ts_language(path.into(), "tree_sitter_json".into()).unwrap() };
     let sg = lang.ast_grep("{\"a\": 123}");
     assert_eq!(
@@ -277,11 +289,16 @@ mod test {
 
   #[test]
   fn test_register_lang() {
+    let path = get_tree_sitter_path();
+    // skip unsupported platform
+    if path.is_empty() {
+      return;
+    }
     let registration = Registration {
       lang_name: "json".to_string(),
       expando_char: Some('_'),
       extensions: vec!["json".into()],
-      lib_path: PathBuf::from(get_tree_sitter_path()),
+      lib_path: PathBuf::from(path),
       meta_var_char: None,
       symbol: "tree_sitter_json".into(),
     };

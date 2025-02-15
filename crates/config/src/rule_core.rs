@@ -1,8 +1,9 @@
+use crate::check_var::{check_rule_with_hint, CheckHint};
 use crate::fixer::{Fixer, FixerError, SerializableFixer};
 use crate::rule::referent_rule::RuleRegistration;
 use crate::rule::Rule;
 use crate::rule::{RuleSerializeError, SerializableRule};
-use crate::transform::{apply_env_transform, Transformation};
+use crate::transform::{Transform, TransformError, Transformation};
 use crate::DeserializeEnv;
 
 use ast_grep_core::language::Language;
@@ -16,24 +17,28 @@ use schemars::JsonSchema;
 use thiserror::Error;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 
 #[derive(Debug, Error)]
-pub enum RuleConfigError {
+pub enum RuleCoreError {
   #[error("Fail to parse yaml as RuleConfig")]
   Yaml(#[from] YamlError),
-  #[error("Rule is not configured correctly.")]
-  Rule(#[from] RuleSerializeError),
-  #[error("Utility rule is not configured correctly.")]
+  #[error("`utils` is not configured correctly.")]
   Utils(#[source] RuleSerializeError),
-  #[error("fix pattern is invalid.")]
-  Fixer(#[from] FixerError),
-  #[error("constraints is not configured correctly.")]
+  #[error("`rule` is not configured correctly.")]
+  Rule(#[from] RuleSerializeError),
+  #[error("`constraints` is not configured correctly.")]
   Constraints(#[source] RuleSerializeError),
+  #[error("`transform` is not configured correctly.")]
+  Transform(#[from] TransformError),
+  #[error("`fix` pattern is invalid.")]
+  Fixer(#[from] FixerError),
+  #[error("Undefined meta var `{0}` used in `{1}`.")]
+  UndefinedMetaVar(String, &'static str),
 }
 
-type RResult<T> = std::result::Result<T, RuleConfigError>;
+type RResult<T> = std::result::Result<T, RuleCoreError>;
 
 /// Used for global rules, rewriters, and pyo3/napi
 #[derive(Serialize, Deserialize, Clone, JsonSchema)]
@@ -55,29 +60,35 @@ pub struct SerializableRuleCore {
 }
 
 impl SerializableRuleCore {
-  fn get_deserialize_env<L: Language>(&self, env: DeserializeEnv<L>) -> RResult<DeserializeEnv<L>> {
+  pub(crate) fn get_deserialize_env<L: Language>(
+    &self,
+    env: DeserializeEnv<L>,
+  ) -> RResult<DeserializeEnv<L>> {
     if let Some(utils) = &self.utils {
       let env = env
         .register_local_utils(utils)
-        .map_err(RuleConfigError::Rule)?;
+        .map_err(RuleCoreError::Utils)?;
       Ok(env)
     } else {
       Ok(env)
     }
   }
 
-  fn get_meta_var_matchers<L: Language>(
+  fn get_constraints<L: Language>(
     &self,
     env: &DeserializeEnv<L>,
   ) -> RResult<HashMap<String, Rule<L>>> {
-    let mut matchers = HashMap::new();
-    let Some(constraints) = &self.constraints else {
-      return Ok(matchers);
+    let mut constraints = HashMap::new();
+    let Some(serde_cons) = &self.constraints else {
+      return Ok(constraints);
     };
-    for (key, ser) in constraints {
-      matchers.insert(key.to_string(), env.deserialize_rule(ser.clone())?);
+    for (key, ser) in serde_cons {
+      let constraint = env
+        .deserialize_rule(ser.clone())
+        .map_err(RuleCoreError::Constraints)?;
+      constraints.insert(key.to_string(), constraint);
     }
-    Ok(matchers)
+    Ok(constraints)
   }
 
   fn get_fixer<L: Language>(&self, env: &DeserializeEnv<L>) -> RResult<Option<Fixer<L>>> {
@@ -89,18 +100,18 @@ impl SerializableRuleCore {
     }
   }
 
-  // TODO: this is wrong, it does not register local utils to the env
-  pub(crate) fn get_matcher_from_env<L: Language>(
-    &self,
-    env: &DeserializeEnv<L>,
-  ) -> RResult<RuleCore<L>> {
+  fn get_matcher_from_env<L: Language>(&self, env: &DeserializeEnv<L>) -> RResult<RuleCore<L>> {
     let rule = env.deserialize_rule(self.rule.clone())?;
-    let matchers = self.get_meta_var_matchers(env)?;
-    let transform = self.transform.clone();
+    let constraints = self.get_constraints(env)?;
+    let transform = self
+      .transform
+      .as_ref()
+      .map(|t| Transform::deserialize(t, env))
+      .transpose()?;
     let fixer = self.get_fixer(env)?;
     Ok(
       RuleCore::new(rule)
-        .with_matchers(matchers)
+        .with_matchers(constraints)
         .with_utils(env.registration.clone())
         .with_transform(transform)
         .with_fixer(fixer),
@@ -108,16 +119,33 @@ impl SerializableRuleCore {
   }
 
   pub fn get_matcher<L: Language>(&self, env: DeserializeEnv<L>) -> RResult<RuleCore<L>> {
+    self.get_matcher_with_hint(env, CheckHint::Normal)
+  }
+
+  pub(crate) fn get_matcher_with_hint<L: Language>(
+    &self,
+    env: DeserializeEnv<L>,
+    hint: CheckHint,
+  ) -> RResult<RuleCore<L>> {
     let env = self.get_deserialize_env(env)?;
-    self.get_matcher_from_env(&env)
+    let ret = self.get_matcher_from_env(&env)?;
+    check_rule_with_hint(
+      &ret.rule,
+      &ret.utils,
+      &ret.constraints,
+      &self.transform,
+      &ret.fixer,
+      hint,
+    )?;
+    Ok(ret)
   }
 }
 
 pub struct RuleCore<L: Language> {
   rule: Rule<L>,
-  matchers: HashMap<String, Rule<L>>,
+  constraints: HashMap<String, Rule<L>>,
   kinds: Option<BitSet>,
-  transform: Option<HashMap<String, Transformation>>,
+  pub(crate) transform: Option<Transform>,
   pub fixer: Option<Fixer<L>>,
   // this is required to hold util rule reference
   utils: RuleRegistration<L>,
@@ -135,8 +163,11 @@ impl<L: Language> RuleCore<L> {
   }
 
   #[inline]
-  pub fn with_matchers(self, matchers: HashMap<String, Rule<L>>) -> Self {
-    Self { matchers, ..self }
+  pub fn with_matchers(self, constraints: HashMap<String, Rule<L>>) -> Self {
+    Self {
+      constraints,
+      ..self
+    }
   }
 
   #[inline]
@@ -145,7 +176,7 @@ impl<L: Language> RuleCore<L> {
   }
 
   #[inline]
-  pub fn with_transform(self, transform: Option<HashMap<String, Transformation>>) -> Self {
+  pub fn with_transform(self, transform: Option<Transform>) -> Self {
     Self { transform, ..self }
   }
 
@@ -161,14 +192,51 @@ impl<L: Language> RuleCore<L> {
     }
   }
 
-  pub fn add_rewrites(&mut self, rewrites: HashMap<String, RuleCore<L>>) -> RResult<()> {
-    for (id, rewrite) in rewrites {
-      self
-        .utils
-        .insert_rewrite(&id, rewrite)
-        .map_err(RuleSerializeError::from)?;
+  pub fn defined_vars(&self) -> HashSet<&str> {
+    let mut ret = self.rule.defined_vars();
+    for v in self.utils.get_local_util_vars() {
+      ret.insert(v);
     }
-    Ok(())
+    for constraint in self.constraints.values() {
+      for var in constraint.defined_vars() {
+        ret.insert(var);
+      }
+    }
+    if let Some(trans) = &self.transform {
+      for key in trans.keys() {
+        ret.insert(key);
+      }
+    }
+    ret
+  }
+
+  pub(crate) fn do_match<'tree, D: Doc<Lang = L>>(
+    &self,
+    node: Node<'tree, D>,
+    env: &mut Cow<MetaVarEnv<'tree, D>>,
+    enclosing_env: Option<&MetaVarEnv<'tree, D>>,
+  ) -> Option<Node<'tree, D>> {
+    if let Some(kinds) = &self.kinds {
+      if !kinds.contains(node.kind_id().into()) {
+        return None;
+      }
+    }
+    let ret = self.rule.match_node_with_env(node, env)?;
+    if !env.to_mut().match_constraints(&self.constraints) {
+      return None;
+    }
+    if let Some(trans) = &self.transform {
+      let rewriters = self.utils.get_rewriters();
+      let rewriters = rewriters.read();
+      let env = env.to_mut();
+      if let Some(enclosing) = enclosing_env {
+        trans.apply_transform(env, &rewriters, enclosing);
+      } else {
+        let enclosing = env.clone();
+        trans.apply_transform(env, &rewriters, &enclosing);
+      };
+    }
+    Some(ret)
   }
 }
 impl<L: Language> Deref for RuleCore<L> {
@@ -183,7 +251,7 @@ impl<L: Language> Default for RuleCore<L> {
   fn default() -> Self {
     Self {
       rule: Rule::default(),
-      matchers: HashMap::default(),
+      constraints: HashMap::default(),
       kinds: None,
       transform: None,
       fixer: None,
@@ -198,21 +266,7 @@ impl<L: Language> Matcher<L> for RuleCore<L> {
     node: Node<'tree, D>,
     env: &mut Cow<MetaVarEnv<'tree, D>>,
   ) -> Option<Node<'tree, D>> {
-    if let Some(kinds) = &self.kinds {
-      if !kinds.contains(node.kind_id().into()) {
-        return None;
-      }
-    }
-    let ret = self.rule.match_node_with_env(node, env)?;
-    if !env.to_mut().match_constraints(&self.matchers) {
-      return None;
-    }
-    if let Some(trans) = &self.transform {
-      let lang = ret.lang();
-      let rewriters = self.utils.get_rewrites();
-      apply_env_transform(trans, lang, env.to_mut(), rewriters);
-    }
-    Some(ret)
+    self.do_match(node, env, None)
   }
 
   fn potential_kinds(&self) -> Option<BitSet> {
@@ -223,10 +277,61 @@ impl<L: Language> Matcher<L> for RuleCore<L> {
 #[cfg(test)]
 mod test {
   use super::*;
-  use crate::from_str;
-  use crate::rule::referent_rule::ReferentRule;
+  use crate::rule::referent_rule::{ReferentRule, ReferentRuleError};
   use crate::test::TypeScript;
+  use crate::{from_str, GlobalRules};
   use ast_grep_core::matcher::{Pattern, RegexMatcher};
+
+  fn get_matcher(src: &str) -> RResult<RuleCore<TypeScript>> {
+    let env = DeserializeEnv::new(TypeScript::Tsx);
+    let rule: SerializableRuleCore = from_str(src).expect("should word");
+    rule.get_matcher(env)
+  }
+
+  #[test]
+  fn test_rule_error() {
+    let ret = get_matcher(r"rule: {kind: bbb}");
+    assert!(matches!(ret, Err(RuleCoreError::Rule(_))));
+  }
+
+  #[test]
+  fn test_utils_error() {
+    let ret = get_matcher(
+      r"
+rule: { kind: number }
+utils: { testa: {kind: bbb} }
+  ",
+    );
+    assert!(matches!(ret, Err(RuleCoreError::Utils(_))));
+  }
+
+  #[test]
+  fn test_undefined_utils_error() {
+    let ret = get_matcher(r"rule: { kind: number, matches: undefined-util }");
+    match ret {
+      Err(RuleCoreError::Rule(RuleSerializeError::MatchesReference(
+        ReferentRuleError::UndefinedUtil(name),
+      ))) => {
+        assert_eq!(name, "undefined-util");
+      }
+      _ => panic!("wrong error"),
+    }
+  }
+
+  #[test]
+  fn test_cyclic_transform_error() {
+    let ret = get_matcher(
+      r"
+rule: { kind: number }
+transform:
+  A: {substring: {source: $B}}
+  B: {substring: {source: $A}}",
+    );
+    assert!(matches!(
+      ret,
+      Err(RuleCoreError::Transform(TransformError::Cyclic(_)))
+    ));
+  }
 
   #[test]
   fn test_rule_reg_with_utils() {
@@ -248,13 +353,13 @@ mod test {
 
   #[test]
   fn test_rule_with_constraints() {
-    let mut matchers = HashMap::new();
-    matchers.insert(
+    let mut constraints = HashMap::new();
+    constraints.insert(
       "A".to_string(),
       Rule::Regex(RegexMatcher::try_new("a").unwrap()),
     );
     let rule =
-      RuleCore::new(Rule::Pattern(Pattern::new("$A", TypeScript::Tsx))).with_matchers(matchers);
+      RuleCore::new(Rule::Pattern(Pattern::new("$A", TypeScript::Tsx))).with_matchers(constraints);
     let grep = TypeScript::Tsx.ast_grep("a");
     assert!(grep.root().find(&rule).is_some());
     let grep = TypeScript::Tsx.ast_grep("bbb");
@@ -292,38 +397,33 @@ mod test {
     assert_eq!(matched, "2");
   }
 
-  fn get_rewriters() -> HashMap<String, RuleCore<TypeScript>> {
+  fn get_rewriters() -> GlobalRules<TypeScript> {
     // NOTE: initialize a DeserializeEnv here is not 100% correct
     // it does not inherit global rules or local rules
     let env = DeserializeEnv::new(TypeScript::Tsx);
-    let mut ret = HashMap::new();
+    let ret = GlobalRules::default();
     let rewriter: SerializableRuleCore =
       from_str("{rule: {kind: number, pattern: $REWRITE}, fix: yjsnp}").expect("should parse");
-    ret.insert(
-      "re".to_string(),
-      rewriter.get_matcher(env).expect("should work"),
-    );
+    let rewriter = rewriter.get_matcher(env).expect("should work");
+    ret.insert("re", rewriter).expect("should work");
     ret
   }
 
   #[test]
   fn test_rewriter_writing_to_env() {
-    let env = DeserializeEnv::new(TypeScript::Tsx);
+    let rewriters = get_rewriters();
+    let env = DeserializeEnv::new(TypeScript::Tsx).with_rewriters(&rewriters);
     let ser_rule: SerializableRuleCore = from_str(
       r"
 rule: {pattern: $A = $B}
 transform:
   C:
-    applyRewriters:
+    rewrite:
       source: $B
-      rewrites: [re]",
+      rewriters: [re]",
     )
     .expect("should deser");
-    let mut matcher = ser_rule.get_matcher(env).expect("should parse");
-    matcher
-      .add_rewrites(get_rewriters())
-      .expect("should succeed");
-
+    let matcher = ser_rule.get_matcher(env).expect("should parse");
     let grep = TypeScript::Tsx.ast_grep("a = 1 + 2");
     let nm = grep.root().find(&matcher).expect("should match");
     let env = nm.get_env();

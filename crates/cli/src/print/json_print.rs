@@ -16,8 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::io::{Stdout, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 
 // add this macro because neither trait_alias nor type_alias_impl is supported.
 macro_rules! Matches {
@@ -29,8 +27,11 @@ macro_rules! Diffs {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Zero-based character position in a file.
 struct Position {
+  /// Zero-based line number
   line: usize,
+  /// Zero-based character column in a line
   column: usize,
 }
 
@@ -57,6 +58,16 @@ struct MatchNode<'a> {
   range: Range,
 }
 
+/// a sub field of leading and trailing text count around match.
+/// plugin authors can use it to split `lines` into leading, matching and trailing
+/// See ast-grep/ast-grep#1381
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CharCount {
+  leading: usize,
+  trailing: usize,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MatchJSON<'a> {
@@ -64,6 +75,7 @@ struct MatchJSON<'a> {
   range: Range,
   file: Cow<'a, str>,
   lines: String,
+  char_count: CharCount,
   #[serde(skip_serializing_if = "Option::is_none")]
   replacement: Option<Cow<'a, str>>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,24 +144,28 @@ fn get_range(n: &Node<'_, SgLang>) -> Range {
   Range {
     byte_offset: n.range(),
     start: Position {
-      line: start_pos.0,
-      column: start_pos.1,
+      line: start_pos.line(),
+      column: start_pos.column(n),
     },
     end: Position {
-      line: end_pos.0,
-      column: end_pos.1,
+      line: end_pos.line(),
+      column: end_pos.column(n),
     },
   }
 }
 
 impl<'a> MatchJSON<'a> {
-  fn new(nm: NodeMatch<'a, SgLang>, path: &'a str) -> Self {
-    let display = nm.display_context(0, 0);
+  fn new(nm: NodeMatch<'a, SgLang>, path: &'a str, context: (u16, u16)) -> Self {
+    let display = nm.display_context(context.0 as usize, context.1 as usize);
     let lines = format!("{}{}{}", display.leading, display.matched, display.trailing);
     MatchJSON {
       file: Cow::Borrowed(path),
       text: nm.text(),
       lines,
+      char_count: CharCount {
+        leading: display.leading.chars().count(),
+        trailing: display.trailing.chars().count(),
+      },
       language: *nm.lang(),
       replacement: None,
       replacement_offsets: None,
@@ -158,8 +174,8 @@ impl<'a> MatchJSON<'a> {
     }
   }
 
-  fn diff(diff: Diff<'a>, path: &'a str) -> Self {
-    let mut ret = Self::new(diff.node_match, path);
+  fn diff(diff: Diff<'a>, path: &'a str, context: (u16, u16)) -> Self {
+    let mut ret = Self::new(diff.node_match, path, context);
     ret.replacement = Some(diff.replacement);
     ret.replacement_offsets = Some(diff.range);
     ret
@@ -195,7 +211,7 @@ impl<'a> RuleMatchJSON<'a> {
   fn new(nm: NodeMatch<'a, SgLang>, path: &'a str, rule: &'a RuleConfig<SgLang>) -> Self {
     let message = rule.get_message(&nm);
     let labels = get_labels(&nm);
-    let matched = MatchJSON::new(nm, path);
+    let matched = MatchJSON::new(nm, path, (0, 0));
     Self {
       matched,
       rule_id: &rule.id,
@@ -209,7 +225,7 @@ impl<'a> RuleMatchJSON<'a> {
     let nm = &diff.node_match;
     let message = rule.get_message(nm);
     let labels = get_labels(nm);
-    let matched = MatchJSON::diff(diff, path);
+    let matched = MatchJSON::diff(diff, path, (0, 0));
     Self {
       matched,
       rule_id: &rule.id,
@@ -237,10 +253,11 @@ pub enum JsonStyle {
 }
 
 pub struct JSONPrinter<W: Write> {
-  output: Mutex<W>,
+  output: W,
   style: JsonStyle,
+  context: (u16, u16),
   // indicate if any matches happened
-  matched: AtomicBool,
+  matched: bool,
 }
 impl JSONPrinter<Stdout> {
   pub fn stdout(style: JsonStyle) -> Self {
@@ -253,46 +270,53 @@ impl<W: Write> JSONPrinter<W> {
     // no match happened yet
     Self {
       style,
-      output: Mutex::new(output),
-      matched: AtomicBool::new(false),
+      output,
+      context: (0, 0),
+      matched: false,
     }
   }
 
-  fn print_docs<S: Serialize>(&self, mut docs: impl Iterator<Item = S>) -> Result<()> {
+  pub fn context(mut self, context: (u16, u16)) -> Self {
+    self.context = context;
+    self
+  }
+
+  fn print_docs<S: Serialize>(&mut self, mut docs: impl Iterator<Item = S>) -> Result<()> {
     let Some(doc) = docs.next() else {
       return Ok(());
     };
-    let mut lock = self.output.lock().expect("should work");
-    let matched = self.matched.swap(true, Ordering::AcqRel);
+    let output = &mut self.output;
+    let matched = self.matched;
+    self.matched = true;
     match self.style {
       JsonStyle::Pretty => {
         if matched {
-          writeln!(&mut lock, ",")?;
+          writeln!(output, ",")?;
         } else {
-          writeln!(&mut lock)?;
+          writeln!(output)?;
         }
-        serde_json::to_writer_pretty(&mut *lock, &doc)?;
+        serde_json::to_writer_pretty(&mut *output, &doc)?;
         for doc in docs {
-          writeln!(&mut lock, ",")?;
-          serde_json::to_writer_pretty(&mut *lock, &doc)?;
+          writeln!(output, ",")?;
+          serde_json::to_writer_pretty(&mut *output, &doc)?;
         }
       }
       JsonStyle::Stream => {
-        serde_json::to_writer(&mut *lock, &doc)?;
-        writeln!(&mut lock)?;
+        serde_json::to_writer(&mut *output, &doc)?;
+        writeln!(output)?;
         for doc in docs {
-          serde_json::to_writer(&mut *lock, &doc)?;
-          writeln!(&mut lock)?;
+          serde_json::to_writer(&mut *output, &doc)?;
+          writeln!(output)?;
         }
       }
       JsonStyle::Compact => {
         if matched {
-          write!(&mut lock, ",")?;
+          write!(output, ",")?;
         }
-        serde_json::to_writer(&mut *lock, &doc)?;
+        serde_json::to_writer(&mut *output, &doc)?;
         for doc in docs {
-          write!(&mut lock, ",")?;
-          serde_json::to_writer(&mut *lock, &doc)?;
+          write!(output, ",")?;
+          serde_json::to_writer(&mut *output, &doc)?;
         }
       }
     }
@@ -302,7 +326,7 @@ impl<W: Write> JSONPrinter<W> {
 
 impl<W: Write> Printer for JSONPrinter<W> {
   fn print_rule<'a>(
-    &self,
+    &mut self,
     matches: Matches!('a),
     file: SimpleFile<Cow<str>, &String>,
     rule: &RuleConfig<SgLang>,
@@ -312,19 +336,21 @@ impl<W: Write> Printer for JSONPrinter<W> {
     self.print_docs(jsons)
   }
 
-  fn print_matches<'a>(&self, matches: Matches!('a), path: &Path) -> Result<()> {
+  fn print_matches<'a>(&mut self, matches: Matches!('a), path: &Path) -> Result<()> {
     let path = path.to_string_lossy();
-    let jsons = matches.map(|nm| MatchJSON::new(nm, &path));
+    let context = self.context;
+    let jsons = matches.map(|nm| MatchJSON::new(nm, &path, context));
     self.print_docs(jsons)
   }
 
-  fn print_diffs<'a>(&self, diffs: Diffs!('a), path: &Path) -> Result<()> {
+  fn print_diffs<'a>(&mut self, diffs: Diffs!('a), path: &Path) -> Result<()> {
     let path = path.to_string_lossy();
-    let jsons = diffs.map(|diff| MatchJSON::diff(diff, &path));
+    let context = self.context;
+    let jsons = diffs.map(|diff| MatchJSON::diff(diff, &path, context));
     self.print_docs(jsons)
   }
   fn print_rule_diffs(
-    &self,
+    &mut self,
     diffs: Vec<(Diff<'_>, &RuleConfig<SgLang>)>,
     path: &Path,
   ) -> Result<()> {
@@ -335,25 +361,23 @@ impl<W: Write> Printer for JSONPrinter<W> {
     self.print_docs(jsons)
   }
 
-  fn before_print(&self) -> Result<()> {
+  fn before_print(&mut self) -> Result<()> {
     if self.style == JsonStyle::Stream {
       return Ok(());
     }
-    let mut lock = self.output.lock().expect("should work");
-    write!(&mut lock, "[")?;
+    write!(self.output, "[")?;
     Ok(())
   }
 
-  fn after_print(&self) -> Result<()> {
+  fn after_print(&mut self) -> Result<()> {
     if self.style == JsonStyle::Stream {
       return Ok(());
     }
-    let mut lock = self.output.lock().expect("should work");
-    let matched = self.matched.load(Ordering::Acquire);
-    if matched && self.style == JsonStyle::Pretty {
-      writeln!(&mut lock)?;
+    let output = &mut self.output;
+    if self.matched && self.style == JsonStyle::Pretty {
+      writeln!(output)?;
     }
-    writeln!(&mut lock, "]")?;
+    writeln!(output, "]")?;
     Ok(())
   }
 }
@@ -379,14 +403,14 @@ mod test {
     JSONPrinter::new(Test(String::new()), style)
   }
   fn get_text(printer: &JSONPrinter<Test>) -> String {
-    let lock = printer.output.lock().unwrap();
-    lock.0.to_string()
+    let output = &printer.output;
+    output.0.to_string()
   }
 
   #[test]
   fn test_empty_printer() {
     for style in [JsonStyle::Pretty, JsonStyle::Compact] {
-      let printer = make_test_printer(style);
+      let mut printer = make_test_printer(style);
       printer.before_print().unwrap();
       printer
         .print_matches(std::iter::empty(), "test.tsx".as_ref())
@@ -425,7 +449,7 @@ mod test {
   fn test_invariant() {
     for &(source, pattern, _, note) in MATCHES_CASES {
       // heading is required for CI
-      let printer = make_test_printer(JsonStyle::Pretty);
+      let mut printer = make_test_printer(JsonStyle::Pretty);
       let grep = SgLang::from(SupportLang::Tsx).ast_grep(source);
       let matches = grep.root().find_all(pattern);
       printer.before_print().unwrap();
@@ -441,7 +465,7 @@ mod test {
   fn test_replace_json() {
     for &(source, pattern, replace, note) in MATCHES_CASES {
       // heading is required for CI
-      let printer = make_test_printer(JsonStyle::Compact);
+      let mut printer = make_test_printer(JsonStyle::Compact);
       let lang = SgLang::from(SupportLang::Tsx);
       let grep = lang.ast_grep(source);
       let matches = grep.root().find_all(pattern);
@@ -485,7 +509,7 @@ rule:
         continue;
       }
       let source = source.to_string();
-      let printer = make_test_printer(JsonStyle::Pretty);
+      let mut printer = make_test_printer(JsonStyle::Pretty);
       let grep = SgLang::from(SupportLang::Tsx).ast_grep(&source);
       let rule = make_rule(pattern);
       let matches = grep.root().find_all(&rule.matcher);
@@ -502,7 +526,7 @@ rule:
 
   #[test]
   fn test_single_matched_json() {
-    let printer = make_test_printer(JsonStyle::Pretty);
+    let mut printer = make_test_printer(JsonStyle::Pretty);
     let lang = SgLang::from(SupportLang::Tsx);
     let grep = lang.ast_grep("console.log(123)");
     let matches = grep.root().find_all("console.log($A)");
@@ -521,7 +545,7 @@ rule:
 
   #[test]
   fn test_multi_matched_json() {
-    let printer = make_test_printer(JsonStyle::Compact);
+    let mut printer = make_test_printer(JsonStyle::Compact);
     let lang = SgLang::from(SupportLang::Tsx);
     let grep = lang.ast_grep("console.log(1, 2, 3)");
     let matches = grep.root().find_all("console.log($$$A)");
@@ -539,7 +563,7 @@ rule:
   #[test]
   fn test_streaming() {
     for &(source, pattern, _, note) in MATCHES_CASES {
-      let printer = make_test_printer(JsonStyle::Stream);
+      let mut printer = make_test_printer(JsonStyle::Stream);
       let grep = SgLang::from(SupportLang::Tsx).ast_grep(source);
       let matches = grep.root().find_all(pattern);
       printer.before_print().unwrap();
@@ -567,7 +591,7 @@ transform:
 ";
   #[test]
   fn test_transform() {
-    let printer = make_test_printer(JsonStyle::Compact);
+    let mut printer = make_test_printer(JsonStyle::Compact);
     let rule = get_rule_config(&format!("pattern: console.log($A)\n{}", TRANSFORM_TEXT));
     let grep = SgLang::from(SupportLang::TypeScript).ast_grep("console.log(123)");
     let matches = grep.root().find_all(&rule.matcher);

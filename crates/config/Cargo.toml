@@ -21,10 +21,9 @@ bit-set.workspace = true
 globset = "0.4.14"
 regex = { workspace = true, optional = true }
 serde.workspace = true
-serde_yaml = "0.9.30"
+serde_yaml = "0.9.33"
 thiserror.workspace = true
 schemars.workspace = true
 
 [dev-dependencies]
-tempfile = "3.9.0"
-tree-sitter-typescript = "0.20.3"
+tree-sitter-typescript = "0.21.1"

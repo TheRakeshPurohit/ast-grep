@@ -1,9 +1,9 @@
+use crate::py_lang::PyLang;
 use crate::range::Range;
 use crate::SgRoot;
 
 use ast_grep_config::{DeserializeEnv, RuleCore, SerializableRuleCore};
 use ast_grep_core::{NodeMatch, StrDoc};
-use ast_grep_language::SupportLang;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -16,7 +16,7 @@ use pythonize::depythonize;
 
 #[pyclass(mapping)]
 pub struct SgNode {
-  pub inner: NodeMatch<'static, StrDoc<SupportLang>>,
+  pub inner: NodeMatch<'static, StrDoc<PyLang>>,
   // refcount SgRoot
   pub(crate) root: Py<SgRoot>,
 }
@@ -29,7 +29,11 @@ unsafe impl Send for SgNode {}
 impl SgNode {
   /*----------  Node Inspection ----------*/
   fn range(&self) -> Range {
-    Range::from(&self.inner)
+    Python::with_gil(|py| {
+      let root = self.root.bind(py);
+      let root = root.borrow();
+      Range::from(&self.inner, &root.position)
+    })
   }
 
   fn is_leaf(&self) -> bool {
@@ -54,31 +58,31 @@ impl SgNode {
 
   /*---------- Search Refinement  ----------*/
   #[pyo3(signature = (**kwargs))]
-  fn matches(&self, kwargs: Option<&PyDict>) -> PyResult<bool> {
+  fn matches(&self, kwargs: Option<Bound<PyDict>>) -> PyResult<bool> {
     let matcher = get_matcher_from_rule(self.inner.lang(), kwargs)?;
     Ok(self.inner.matches(matcher))
   }
 
   #[pyo3(signature = (**kwargs))]
-  fn inside(&self, kwargs: Option<&PyDict>) -> PyResult<bool> {
+  fn inside(&self, kwargs: Option<Bound<PyDict>>) -> PyResult<bool> {
     let matcher = get_matcher_from_rule(self.inner.lang(), kwargs)?;
     Ok(self.inner.inside(matcher))
   }
 
   #[pyo3(signature = (**kwargs))]
-  fn has(&self, kwargs: Option<&PyDict>) -> PyResult<bool> {
+  fn has(&self, kwargs: Option<Bound<PyDict>>) -> PyResult<bool> {
     let matcher = get_matcher_from_rule(self.inner.lang(), kwargs)?;
     Ok(self.inner.has(matcher))
   }
 
   #[pyo3(signature = (**kwargs))]
-  fn precedes(&self, kwargs: Option<&PyDict>) -> PyResult<bool> {
+  fn precedes(&self, kwargs: Option<Bound<PyDict>>) -> PyResult<bool> {
     let matcher = get_matcher_from_rule(self.inner.lang(), kwargs)?;
     Ok(self.inner.precedes(matcher))
   }
 
   #[pyo3(signature = (**kwargs))]
-  fn follows(&self, kwargs: Option<&PyDict>) -> PyResult<bool> {
+  fn follows(&self, kwargs: Option<Bound<PyDict>>) -> PyResult<bool> {
     let matcher = get_matcher_from_rule(self.inner.lang(), kwargs)?;
     Ok(self.inner.follows(matcher))
   }
@@ -122,7 +126,11 @@ impl SgNode {
   }
 
   #[pyo3(signature = (config=None, **rule))]
-  fn find(&self, config: Option<&PyDict>, rule: Option<&PyDict>) -> PyResult<Option<Self>> {
+  fn find(
+    &self,
+    config: Option<Bound<PyDict>>,
+    rule: Option<Bound<PyDict>>,
+  ) -> PyResult<Option<Self>> {
     let matcher = self.get_matcher(config, rule)?;
     if let Some(inner) = self.inner.find(matcher) {
       Ok(Some(Self {
@@ -135,7 +143,11 @@ impl SgNode {
   }
 
   #[pyo3(signature = (config=None, **rule))]
-  fn find_all(&self, config: Option<&PyDict>, rule: Option<&PyDict>) -> PyResult<Vec<Self>> {
+  fn find_all(
+    &self,
+    config: Option<Bound<PyDict>>,
+    rule: Option<Bound<PyDict>>,
+  ) -> PyResult<Vec<Self>> {
     let matcher = self.get_matcher(config, rule)?;
     Ok(
       self
@@ -154,6 +166,17 @@ impl SgNode {
       inner: inner.into(),
       root: self.root.clone(),
     })
+  }
+
+  fn field_children(&self, name: &str) -> Vec<SgNode> {
+    self
+      .inner
+      .field_children(name)
+      .map(|inner| Self {
+        inner: inner.into(),
+        root: self.root.clone(),
+      })
+      .collect()
   }
 
   fn parent(&self) -> Option<SgNode> {
@@ -228,6 +251,56 @@ impl SgNode {
       .collect()
   }
 
+  /*---------- Edit  ----------*/
+  fn replace(&self, text: &str) -> Edit {
+    let byte_range = self.inner.range();
+    Python::with_gil(|py| {
+      let root = self.root.bind(py);
+      let root = root.borrow();
+      let start_pos = root.position.byte_to_char(byte_range.start);
+      let end_pos = root.position.byte_to_char(byte_range.end);
+      Edit {
+        start_pos,
+        end_pos,
+        inserted_text: text.to_string(),
+      }
+    })
+  }
+
+  fn commit_edits(&self, mut edits: Vec<Edit>) -> String {
+    edits.sort_by_key(|edit| edit.start_pos);
+    let mut new_content = String::new();
+    let old_content = self.text();
+    let converted: Vec<_> = Python::with_gil(move |py| {
+      let root = self.root.bind(py);
+      let root = root.borrow();
+      let conv = &root.position;
+      edits
+        .into_iter()
+        .map(|mut e| {
+          e.start_pos = conv.char_to_byte(e.start_pos);
+          e.end_pos = conv.char_to_byte(e.end_pos);
+          e
+        })
+        .collect()
+    });
+    let offset = self.inner.range().start;
+    let mut start = 0;
+    for diff in converted {
+      let pos = diff.start_pos - offset;
+      // skip overlapping edits
+      if start > pos {
+        continue;
+      }
+      new_content.push_str(&old_content[start..pos]);
+      new_content.push_str(&diff.inserted_text);
+      start = diff.end_pos - offset;
+    }
+    // add trailing statements
+    new_content.push_str(&old_content[start..]);
+    new_content
+  }
+
   /*---------- Magic Method  ----------*/
   fn __hash__(&self) -> u64 {
     let mut s = DefaultHasher::new();
@@ -264,9 +337,9 @@ impl SgNode {
 impl SgNode {
   fn get_matcher(
     &self,
-    config: Option<&PyDict>,
-    kwargs: Option<&PyDict>,
-  ) -> PyResult<RuleCore<SupportLang>> {
+    config: Option<Bound<PyDict>>,
+    kwargs: Option<Bound<PyDict>>,
+  ) -> PyResult<RuleCore<PyLang>> {
     let lang = self.inner.lang();
     let config = if let Some(config) = config {
       config_from_dict(config)?
@@ -281,12 +354,12 @@ impl SgNode {
   }
 }
 
-fn config_from_dict(dict: &PyDict) -> PyResult<SerializableRuleCore> {
-  Ok(depythonize(dict)?)
+fn config_from_dict(dict: Bound<PyDict>) -> PyResult<SerializableRuleCore> {
+  Ok(depythonize(dict.as_any())?)
 }
 
-fn config_from_rule(dict: &PyDict) -> PyResult<SerializableRuleCore> {
-  let rule = depythonize(dict)?;
+fn config_from_rule(dict: Bound<PyDict>) -> PyResult<SerializableRuleCore> {
+  let rule = depythonize(dict.as_any())?;
   Ok(SerializableRuleCore {
     rule,
     constraints: None,
@@ -296,13 +369,21 @@ fn config_from_rule(dict: &PyDict) -> PyResult<SerializableRuleCore> {
   })
 }
 
-fn get_matcher_from_rule(
-  lang: &SupportLang,
-  dict: Option<&PyDict>,
-) -> PyResult<RuleCore<SupportLang>> {
+fn get_matcher_from_rule(lang: &PyLang, dict: Option<Bound<PyDict>>) -> PyResult<RuleCore<PyLang>> {
   let rule = dict.ok_or_else(|| PyErr::new::<PyValueError, _>("rule must not be empty"))?;
   let env = DeserializeEnv::new(*lang);
   let config = config_from_rule(rule)?;
   let matcher = config.get_matcher(env).context("cannot get matcher")?;
   Ok(matcher)
+}
+
+#[pyclass(get_all, set_all)]
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Edit {
+  /// The start position of the edit in character
+  pub start_pos: usize,
+  /// The end position of the edit in character
+  pub end_pos: usize,
+  /// The text to be inserted
+  pub inserted_text: String,
 }

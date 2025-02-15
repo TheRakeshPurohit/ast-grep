@@ -150,3 +150,22 @@ def test_pattern():
         selector="variable_declarator",
     ))
     assert node == node2
+
+def test_range_rule():
+    node = root.find(range={
+        "start": {"line": 0, "column": 9},
+        "end": {"line": 0, "column": 13},
+    })
+    assert node
+    assert node.text() == "test"
+    node = root.find(range={
+        "start": {"line": 0, "column": 9},
+        "end": {"line": 0, "column": 12},
+    })
+    assert not node
+
+def test_strictness():
+    node = root.find(pattern={
+        "context": "let b = 456",
+        "strictness": "signature",
+    })

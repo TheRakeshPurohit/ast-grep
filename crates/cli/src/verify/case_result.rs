@@ -21,6 +21,11 @@ pub enum CaseStatus<'a> {
   Validated,
   /// Reported correct issue for invalid code
   Reported,
+  /// User accepted new snapshot updates
+  Updated {
+    source: &'a str,
+    updated: TestSnapshot,
+  },
   /// Reported issues for invalid code but it is wrong
   Wrong {
     source: &'a str,
@@ -71,9 +76,31 @@ impl<'a> CaseStatus<'a> {
       nullable => CaseStatus::Wrong {
         source: case,
         actual,
-        expected: nullable.map(Clone::clone),
+        expected: nullable.cloned(),
       },
     }
+  }
+
+  pub fn accept(&mut self) -> bool {
+    let CaseStatus::Wrong { source, actual, .. } = self else {
+      return false;
+    };
+    let updated = std::mem::replace(
+      actual,
+      TestSnapshot {
+        fixed: None,
+        labels: vec![],
+      },
+    );
+    *self = CaseStatus::Updated { source, updated };
+    true
+  }
+
+  pub fn is_pass(&self) -> bool {
+    matches!(
+      self,
+      CaseStatus::Validated | CaseStatus::Reported | CaseStatus::Updated { .. }
+    )
   }
 }
 
@@ -85,20 +112,17 @@ pub struct CaseResult<'a> {
   pub cases: Vec<CaseStatus<'a>>,
 }
 
-impl<'a> CaseResult<'a> {
+impl CaseResult<'_> {
   /// Did all cases in the rule-test pass the test?
   pub fn passed(&self) -> bool {
-    self
-      .cases
-      .iter()
-      .all(|c| matches!(c, CaseStatus::Validated | CaseStatus::Reported))
+    self.cases.iter().all(CaseStatus::is_pass)
   }
   pub fn changed_snapshots(&self) -> TestSnapshots {
     let snapshots = self
       .cases
       .iter()
       .filter_map(|c| match c {
-        CaseStatus::Wrong { source, actual, .. } => Some((source.to_string(), actual.clone())),
+        CaseStatus::Updated { source, updated } => Some((source.to_string(), updated.clone())),
         _ => None,
       })
       .collect();

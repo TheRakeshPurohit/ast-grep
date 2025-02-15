@@ -1,5 +1,5 @@
-use crate::error::ErrorContext as EC;
-use crate::lang::{CustomLang, LanguageGlobs, SgLang};
+use crate::lang::{CustomLang, LanguageGlobs, SerializableInjection, SgLang};
+use crate::utils::{ErrorContext as EC, RuleOverwrite, RuleTrace};
 
 use anyhow::{Context, Result};
 use ast_grep_config::{
@@ -7,7 +7,6 @@ use ast_grep_config::{
 };
 use ast_grep_language::config_file_type;
 use ignore::WalkBuilder;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
@@ -49,90 +48,136 @@ pub struct AstGrepConfig {
   /// additional file globs for languages
   #[serde(skip_serializing_if = "Option::is_none")]
   pub language_globs: Option<LanguageGlobs>,
+  /// injection config for embedded languages
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub language_injections: Vec<SerializableInjection>,
 }
 
-pub fn find_rules(
-  config_path: Option<PathBuf>,
-  rule_filter: Option<&Regex>,
-) -> Result<RuleCollection<SgLang>> {
-  let config_path =
-    find_config_path_with_default(config_path, None).context(EC::ReadConfiguration)?;
-  let config_str = read_to_string(&config_path).context(EC::ReadConfiguration)?;
-  let sg_config: AstGrepConfig = from_str(&config_str).context(EC::ParseConfiguration)?;
-  let base_dir = config_path
-    .parent()
-    .expect("config file must have parent directory");
-  let global_rules = find_util_rules(base_dir, sg_config.util_dirs)?;
-  read_directory_yaml(base_dir, sg_config.rule_dirs, global_rules, rule_filter)
+#[derive(Clone)]
+pub struct ProjectConfig {
+  pub project_dir: PathBuf,
+  /// YAML rule directories
+  pub rule_dirs: Vec<PathBuf>,
+  /// test configurations
+  pub test_configs: Option<Vec<TestConfig>>,
+  /// util rules directories
+  pub util_dirs: Option<Vec<PathBuf>>,
 }
 
-pub fn register_custom_language(config_path: Option<PathBuf>) -> Result<()> {
-  let Ok(mut path) = find_config_path_with_default(config_path, None) else {
-    return Ok(()); // do not report error if no sgconfig.yml is found
-  };
-  let Ok(config_str) = read_to_string(&path) else {
-    return Ok(()); // suppress error when register custom lang
-  };
-  let sg_config: AstGrepConfig = from_str(&config_str).context(EC::ParseConfiguration)?;
-  path.pop();
+impl ProjectConfig {
+  // return None if config file does not exist
+  fn discover_project(config_path: Option<PathBuf>) -> Result<Option<(PathBuf, AstGrepConfig)>> {
+    let config_path = find_config_path_with_default(config_path).context(EC::ProjectNotExist)?;
+    // NOTE: if config file does not exist, return None
+    let Some(config_path) = config_path else {
+      return Ok(None);
+    };
+    let config_str = read_to_string(&config_path).context(EC::ReadConfiguration)?;
+    let sg_config: AstGrepConfig = from_str(&config_str).context(EC::ParseConfiguration)?;
+    let project_dir = config_path
+      .parent()
+      .expect("config file must have parent directory")
+      .to_path_buf();
+    Ok(Some((project_dir, sg_config)))
+  }
+
+  pub fn find_rules(
+    &self,
+    rule_overwrite: RuleOverwrite,
+  ) -> Result<(RuleCollection<SgLang>, RuleTrace)> {
+    let global_rules = find_util_rules(self)?;
+    read_directory_yaml(self, global_rules, rule_overwrite)
+  }
+  /// returns a Result of Result.
+  /// The inner Result is for configuration not found, or ProjectNotExist
+  /// The outer Result is for definitely wrong config.
+  pub fn setup(config_path: Option<PathBuf>) -> Result<Result<Self>> {
+    let Some((project_dir, mut sg_config)) = Self::discover_project(config_path)? else {
+      return Ok(Err(anyhow::anyhow!(EC::ProjectNotExist)));
+    };
+    let config = ProjectConfig {
+      project_dir,
+      rule_dirs: sg_config.rule_dirs.drain(..).collect(),
+      test_configs: sg_config.test_configs.take(),
+      util_dirs: sg_config.util_dirs.take(),
+    };
+    // sg_config will not use rule dirs and test configs anymore
+    register_custom_language(&config.project_dir, sg_config)?;
+    Ok(Ok(config))
+  }
+}
+
+fn register_custom_language(project_dir: &Path, sg_config: AstGrepConfig) -> Result<()> {
   if let Some(custom_langs) = sg_config.custom_languages {
-    SgLang::register_custom_language(path, custom_langs);
+    SgLang::register_custom_language(project_dir, custom_langs)?;
   }
   if let Some(globs) = sg_config.language_globs {
     SgLang::register_globs(globs)?;
   }
+  SgLang::register_injections(sg_config.language_injections)?;
   Ok(())
 }
 
-fn find_util_rules(
-  base_dir: &Path,
-  util_dirs: Option<Vec<PathBuf>>,
-) -> Result<GlobalRules<SgLang>> {
-  let Some(util_dirs) = util_dirs else {
+fn build_util_walker(base_dir: &Path, util_dirs: &Option<Vec<PathBuf>>) -> Option<WalkBuilder> {
+  let mut util_dirs = util_dirs.as_ref()?.iter();
+  let first = util_dirs.next()?;
+  let mut walker = WalkBuilder::new(base_dir.join(first));
+  for dir in util_dirs {
+    walker.add(base_dir.join(dir));
+  }
+  Some(walker)
+}
+
+fn find_util_rules(config: &ProjectConfig) -> Result<GlobalRules<SgLang>> {
+  let ProjectConfig {
+    project_dir,
+    util_dirs,
+    ..
+  } = config;
+  let Some(mut walker) = build_util_walker(project_dir, util_dirs) else {
     return Ok(GlobalRules::default());
   };
   let mut utils = vec![];
-  // TODO: use WalkBuilder::add to avoid loop
-  for dir in util_dirs {
-    let dir_path = base_dir.join(dir);
-    let walker = WalkBuilder::new(&dir_path)
-      .types(config_file_type())
-      .build();
-    for dir in walker {
-      let config_file = dir.with_context(|| EC::WalkRuleDir(dir_path.clone()))?;
-      // file_type is None only if it is stdin, safe to unwrap here
-      if !config_file
-        .file_type()
-        .expect("file type should be available for non-stdin")
-        .is_file()
-      {
-        continue;
-      }
-      let path = config_file.path();
-      let file = read_to_string(path)?;
-      let new_configs = from_str(&file)?;
-      utils.push(new_configs);
+  let walker = walker.types(config_file_type()).build();
+  for dir in walker {
+    let config_file = dir.with_context(|| EC::WalkRuleDir(PathBuf::new()))?;
+    // file_type is None only if it is stdin, safe to panic here
+    if !config_file
+      .file_type()
+      .expect("file type should be available for non-stdin")
+      .is_file()
+    {
+      continue;
     }
+    let path = config_file.path();
+    let file = read_to_string(path)?;
+    let new_configs = from_str(&file)?;
+    utils.push(new_configs);
   }
-  let ret = DeserializeEnv::parse_global_utils(utils).context("TODO!")?;
+
+  let ret = DeserializeEnv::parse_global_utils(utils).context(EC::InvalidGlobalUtils)?;
   Ok(ret)
 }
 
 fn read_directory_yaml(
-  base_dir: &Path,
-  rule_dirs: Vec<PathBuf>,
+  config: &ProjectConfig,
   global_rules: GlobalRules<SgLang>,
-  rule_filter: Option<&Regex>,
-) -> Result<RuleCollection<SgLang>> {
+  rule_overwrite: RuleOverwrite,
+) -> Result<(RuleCollection<SgLang>, RuleTrace)> {
   let mut configs = vec![];
+  let ProjectConfig {
+    project_dir,
+    rule_dirs,
+    ..
+  } = config;
   for dir in rule_dirs {
-    let dir_path = base_dir.join(dir);
+    let dir_path = project_dir.join(dir);
     let walker = WalkBuilder::new(&dir_path)
       .types(config_file_type())
       .build();
     for dir in walker {
       let config_file = dir.with_context(|| EC::WalkRuleDir(dir_path.clone()))?;
-      // file_type is None only if it is stdin, safe to unwrap here
+      // file_type is None only if it is stdin, safe to panic here
       if !config_file
         .file_type()
         .expect("file type should be available for non-stdin")
@@ -145,30 +190,31 @@ fn read_directory_yaml(
       configs.extend(new_configs);
     }
   }
+  let total_rule_count = configs.len();
 
-  let configs = if let Some(filter) = rule_filter {
-    filter_rule_by_regex(configs, filter)?
-  } else {
-    configs
+  let configs = rule_overwrite.process_configs(configs)?;
+  let collection = RuleCollection::try_new(configs).context(EC::GlobPattern)?;
+  let effective_rule_count = collection.total_rule_count();
+  let trace = RuleTrace {
+    file_trace: Default::default(),
+    effective_rule_count,
+    skipped_rule_count: total_rule_count - effective_rule_count,
   };
-
-  RuleCollection::try_new(configs).context(EC::GlobPattern)
+  Ok((collection, trace))
 }
 
-fn filter_rule_by_regex(
+pub fn with_rule_stats(
   configs: Vec<RuleConfig<SgLang>>,
-  filter: &Regex,
-) -> Result<Vec<RuleConfig<SgLang>>> {
-  let selected: Vec<_> = configs
-    .into_iter()
-    .filter(|c| filter.is_match(&c.id))
-    .collect();
-
-  if selected.is_empty() {
-    Err(anyhow::anyhow!(EC::RuleNotFound(filter.to_string())))
-  } else {
-    Ok(selected)
-  }
+) -> Result<(RuleCollection<SgLang>, RuleTrace)> {
+  let total_rule_count = configs.len();
+  let collection = RuleCollection::try_new(configs).context(EC::GlobPattern)?;
+  let effective_rule_count = collection.total_rule_count();
+  let trace = RuleTrace {
+    file_trace: Default::default(),
+    effective_rule_count,
+    skipped_rule_count: total_rule_count - effective_rule_count,
+  };
+  Ok((collection, trace))
 }
 
 pub fn read_rule_file(
@@ -184,43 +230,23 @@ pub fn read_rule_file(
   parsed.with_context(|| EC::ParseRule(path.to_path_buf()))
 }
 
-/// Returns the base_directory where config is and config object.
-pub fn read_config_from_dir<P: AsRef<Path>>(path: P) -> Result<Option<(PathBuf, AstGrepConfig)>> {
-  let mut config_path =
-    find_config_path_with_default(None, Some(path.as_ref())).context(EC::ReadConfiguration)?;
-  if !config_path.is_file() {
-    return Ok(None);
-  }
-  let config_str = read_to_string(&config_path).context(EC::ReadConfiguration)?;
-  let sg_config = from_str(&config_str).context(EC::ParseConfiguration)?;
-  // remove sgconfig.yml from the path
-  config_path.pop(); // ./sg_config -> ./
-  Ok(Some((config_path, sg_config)))
-}
-
 const CONFIG_FILE: &str = "sgconfig.yml";
 
-pub fn find_config_path_with_default(
-  config_path: Option<PathBuf>,
-  base: Option<&Path>,
-) -> Result<PathBuf> {
-  if let Some(config) = config_path {
-    return Ok(config);
+/// return None if config file does not exist
+fn find_config_path_with_default(config_path: Option<PathBuf>) -> Result<Option<PathBuf>> {
+  if config_path.is_some() {
+    return Ok(config_path);
   }
-  let mut path = if let Some(base) = base {
-    base.to_path_buf()
-  } else {
-    std::env::current_dir()?
-  };
+  let mut path = std::env::current_dir()?;
   loop {
     let maybe_config = path.join(CONFIG_FILE);
     if maybe_config.exists() {
-      break Ok(maybe_config);
+      break Ok(Some(maybe_config));
     }
     if let Some(parent) = path.parent() {
       path = parent.to_path_buf();
     } else {
-      break Ok(PathBuf::from(CONFIG_FILE));
+      break Ok(None);
     }
   }
 }

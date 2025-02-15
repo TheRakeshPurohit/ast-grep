@@ -3,7 +3,7 @@ name = "ast-grep"
 description = "Search and Rewrite code at large scale using precise AST pattern"
 keywords = ["ast", "pattern", "codemod", "search", "rewrite"]
 categories = ["command-line-utilities", "development-tools", "parsing"]
-default-run = "sg"
+default-run = "ast-grep"
 # use relative path because maturin does not recognize
 readme = "../../README.md"
 license-file = "../../LICENSE"
@@ -18,12 +18,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "sg"
+name = "ast-grep"
 path = "src/main.rs"
 
 [[bin]]
-name = "ast-grep"
-path = "src/bin/ast-grep.rs"
+name = "sg"
+path = "src/bin/alias.rs"
 
 [dependencies]
 ast-grep-core.workspace = true
@@ -31,26 +31,32 @@ ast-grep-config.workspace = true
 ast-grep-dynamic.workspace = true
 ast-grep-language.workspace = true
 ast-grep-lsp.workspace = true
+tree-sitter.workspace = true
 
-ansi_term = "0.12"
+ansi_term = "0.12.1"
 anyhow.workspace = true
 atty = "0.2.14"
-clap = { version = "4.4.18", features = ["derive"] }
+clap = { version = "4.5.4", features = ["derive"] }
 codespan-reporting = "0.11.1"
-crossterm = "0.27.0"
+crossterm = "0.28.0"
 ignore.workspace = true
 regex.workspace = true
-bit-set.workspace = true
-inquire = "0.6.2"
-num_cpus = "1.16.0"
+inquire = "0.7.5"
 serde.workspace = true
-serde_json = "1.0.112"
-serde_yaml = "0.9.30"
-similar = { version = "2.4.0", features = ["inline"] }
-tokio = { version = "1", features = ["rt-multi-thread", "io-std"] }
-clap_complete = "4.4.9"
+serde_json = "1.0.116"
+serde_yaml.workspace = true
+similar = { version = "2.5.0", features = ["inline"] }
+tokio = { version = "1.37.0", features = ["rt-multi-thread", "io-std"] }
+clap_complete = "4.5.2"
 
 [dev-dependencies]
-assert_cmd = "2.0.13"
+assert_cmd = "2.0.14"
 predicates = "3.1.0"
-tempfile = "3.9.0"
+tempfile = "3.10.1"
+
+# Support cargo bininstall, https://github.com/ast-grep/ast-grep/issues/1742
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ version }/app-{ target }{ archive-suffix }"
+pkg-fmt = "zip"
+bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install"]

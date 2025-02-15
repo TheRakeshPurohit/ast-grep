@@ -1,4 +1,6 @@
 mod deserialize_env;
+mod nth_child;
+mod range;
 pub mod referent_rule;
 mod relational_rule;
 mod stop_by;
@@ -8,6 +10,8 @@ pub use relational_rule::Relation;
 pub use stop_by::StopBy;
 
 use crate::maybe::Maybe;
+use nth_child::{NthChild, NthChildError, SerializableNthChild};
+use range::{RangeMatcher, RangeMatcherError, SerializableRange};
 use referent_rule::{ReferentRule, ReferentRuleError};
 use relational_rule::{Follows, Has, Inside, Precedes};
 
@@ -15,12 +19,13 @@ use ast_grep_core::language::Language;
 use ast_grep_core::matcher::{KindMatcher, KindMatcherError, RegexMatcher, RegexMatcherError};
 use ast_grep_core::meta_var::MetaVarEnv;
 use ast_grep_core::ops as o;
-use ast_grep_core::{Doc, Matcher, Node, Pattern, PatternError};
+use ast_grep_core::{Doc, MatchStrictness, Matcher, Node, Pattern, PatternError};
 
 use bit_set::BitSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use thiserror::Error;
 
 /// A rule object to find matching AST nodes. We have three categories of rules in ast-grep.
@@ -47,6 +52,15 @@ pub struct SerializableRule {
   /// A Rust regular expression to match the node's text. https://docs.rs/regex/latest/regex/#syntax
   #[serde(default, skip_serializing_if = "Maybe::is_absent")]
   pub regex: Maybe<String>,
+  /// `nth_child` accepts number, string or object.
+  /// It specifies the position in nodes' sibling list.
+  #[serde(default, skip_serializing_if = "Maybe::is_absent", rename = "nthChild")]
+  pub nth_child: Maybe<SerializableNthChild>,
+  /// `range` accepts a range object.
+  /// the target node must exactly appear in the range.
+  #[serde(default, skip_serializing_if = "Maybe::is_absent")]
+  pub range: Maybe<SerializableRange>,
+
   // relational
   /// `inside` accepts a relational rule object.
   /// the target node must appear inside of another node matching the `inside` sub-rule.
@@ -81,19 +95,21 @@ pub struct SerializableRule {
   pub matches: Maybe<String>,
 }
 
-pub struct Categorized {
+struct Categorized {
   pub atomic: AtomicRule,
   pub relational: RelationalRule,
   pub composite: CompositeRule,
 }
 
 impl SerializableRule {
-  pub fn categorized(self) -> Categorized {
+  fn categorized(self) -> Categorized {
     Categorized {
       atomic: AtomicRule {
         pattern: self.pattern.into(),
         kind: self.kind.into(),
         regex: self.regex.into(),
+        nth_child: self.nth_child.into(),
+        range: self.range.into(),
       },
       relational: RelationalRule {
         inside: self.inside.into(),
@@ -111,15 +127,58 @@ impl SerializableRule {
   }
 }
 
-#[derive(Serialize, Deserialize, Clone, Default, JsonSchema)]
 pub struct AtomicRule {
   pub pattern: Option<PatternStyle>,
   pub kind: Option<String>,
   pub regex: Option<String>,
+  pub nth_child: Option<SerializableNthChild>,
+  pub range: Option<SerializableRange>,
+}
+#[derive(Serialize, Deserialize, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum Strictness {
+  /// all nodes are matched
+  Cst,
+  /// all nodes except source trivial nodes are matched.
+  Smart,
+  /// only ast nodes are matched
+  Ast,
+  /// ast-nodes excluding comments are matched
+  Relaxed,
+  /// ast-nodes excluding comments, without text
+  Signature,
+}
+
+impl From<MatchStrictness> for Strictness {
+  fn from(value: MatchStrictness) -> Self {
+    use MatchStrictness as M;
+    use Strictness as S;
+    match value {
+      M::Cst => S::Cst,
+      M::Smart => S::Smart,
+      M::Ast => S::Ast,
+      M::Relaxed => S::Relaxed,
+      M::Signature => S::Signature,
+    }
+  }
+}
+
+impl From<Strictness> for MatchStrictness {
+  fn from(value: Strictness) -> Self {
+    use MatchStrictness as M;
+    use Strictness as S;
+    match value {
+      S::Cst => M::Cst,
+      S::Smart => M::Smart,
+      S::Ast => M::Ast,
+      S::Relaxed => M::Relaxed,
+      S::Signature => M::Signature,
+    }
+  }
 }
 
 /// A String pattern will match one single AST node according to pattern syntax.
-/// Or an object with field `context` and `selector`.
+/// Or an object with field `context`, `selector` and optionally `strictness`.
 #[derive(Serialize, Deserialize, Clone, JsonSchema)]
 #[serde(untagged)]
 pub enum PatternStyle {
@@ -128,11 +187,12 @@ pub enum PatternStyle {
     /// The surrounding code that helps to resolve any ambiguity in the syntax.
     context: String,
     /// The sub-syntax node kind that is the actual matcher of the pattern.
-    selector: String,
+    selector: Option<String>,
+    /// Strictness of the pattern. More strict pattern matches fewer nodes.
+    strictness: Option<Strictness>,
   },
 }
 
-#[derive(Serialize, Deserialize, Clone, Default, JsonSchema)]
 pub struct RelationalRule {
   pub inside: Option<Box<Relation>>,
   pub has: Option<Box<Relation>>,
@@ -140,7 +200,6 @@ pub struct RelationalRule {
   pub follows: Option<Box<Relation>>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct CompositeRule {
   pub all: Option<Vec<SerializableRule>>,
   pub any: Option<Vec<SerializableRule>>,
@@ -153,6 +212,8 @@ pub enum Rule<L: Language> {
   Pattern(Pattern<L>),
   Kind(KindMatcher<L>),
   Regex(RegexMatcher<L>),
+  NthChild(NthChild<L>),
+  Range(RangeMatcher<L>),
   // relational
   Inside(Box<Inside<L>>),
   Has(Box<Has<L>>),
@@ -167,7 +228,10 @@ pub enum Rule<L: Language> {
 impl<L: Language> Rule<L> {
   pub fn is_atomic(&self) -> bool {
     use Rule::*;
-    matches!(self, Pattern(_) | Kind(_) | Regex(_))
+    matches!(
+      self,
+      Pattern(_) | Kind(_) | Regex(_) | NthChild(_) | Range(_)
+    )
   }
   pub fn is_relational(&self) -> bool {
     use Rule::*;
@@ -179,6 +243,7 @@ impl<L: Language> Rule<L> {
     matches!(self, All(_) | Any(_) | Not(_) | Matches(_))
   }
 
+  /// Check if it has a cyclic referent rule with the id.
   pub(crate) fn check_cyclic(&self, id: &str) -> bool {
     match self {
       Rule::All(all) => all.inner().iter().any(|r| r.check_cyclic(id)),
@@ -189,6 +254,44 @@ impl<L: Language> Rule<L> {
         debug_assert!(!rule.is_composite());
         false
       }
+    }
+  }
+
+  pub fn defined_vars(&self) -> HashSet<&str> {
+    match self {
+      Rule::Pattern(p) => p.defined_vars(),
+      Rule::Kind(_) => HashSet::new(),
+      Rule::Regex(_) => HashSet::new(),
+      Rule::NthChild(n) => n.defined_vars(),
+      Rule::Range(_) => HashSet::new(),
+      Rule::Has(c) => c.defined_vars(),
+      Rule::Inside(p) => p.defined_vars(),
+      Rule::Precedes(f) => f.defined_vars(),
+      Rule::Follows(f) => f.defined_vars(),
+      Rule::All(sub) => sub.inner().iter().flat_map(|r| r.defined_vars()).collect(),
+      Rule::Any(sub) => sub.inner().iter().flat_map(|r| r.defined_vars()).collect(),
+      Rule::Not(sub) => sub.inner().defined_vars(),
+      // TODO: this is not correct, we are collecting util vars else where
+      Rule::Matches(_r) => HashSet::new(),
+    }
+  }
+
+  /// check if util rules used are defined
+  pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
+    match self {
+      Rule::Pattern(_) => Ok(()),
+      Rule::Kind(_) => Ok(()),
+      Rule::Regex(_) => Ok(()),
+      Rule::NthChild(n) => n.verify_util(),
+      Rule::Range(_) => Ok(()),
+      Rule::Has(c) => c.verify_util(),
+      Rule::Inside(p) => p.verify_util(),
+      Rule::Precedes(f) => f.verify_util(),
+      Rule::Follows(f) => f.verify_util(),
+      Rule::All(sub) => sub.inner().iter().try_for_each(|r| r.verify_util()),
+      Rule::Any(sub) => sub.inner().iter().try_for_each(|r| r.verify_util()),
+      Rule::Not(sub) => sub.inner().verify_util(),
+      Rule::Matches(r) => Ok(r.verify_util()?),
     }
   }
 }
@@ -205,6 +308,8 @@ impl<L: Language> Matcher<L> for Rule<L> {
       Pattern(pattern) => pattern.match_node_with_env(node, env),
       Kind(kind) => kind.match_node_with_env(node, env),
       Regex(regex) => regex.match_node_with_env(node, env),
+      NthChild(nth_child) => nth_child.match_node_with_env(node, env),
+      Range(range) => range.match_node_with_env(node, env),
       // relational
       Inside(parent) => match_and_add_label(&**parent, node, env),
       Has(child) => match_and_add_label(&**child, node, env),
@@ -225,6 +330,8 @@ impl<L: Language> Matcher<L> for Rule<L> {
       Pattern(pattern) => pattern.potential_kinds(),
       Kind(kind) => kind.potential_kinds(),
       Regex(regex) => regex.potential_kinds(),
+      NthChild(nth_child) => nth_child.potential_kinds(),
+      Range(range) => range.potential_kinds(),
       // relational
       Inside(parent) => parent.potential_kinds(),
       Has(child) => child.potential_kinds(),
@@ -265,12 +372,18 @@ pub enum RuleSerializeError {
   InvalidKind(#[from] KindMatcherError),
   #[error("Rule contains invalid pattern matcher.")]
   InvalidPattern(#[from] PatternError),
+  #[error("Rule contains invalid nthChild.")]
+  NthChild(#[from] NthChildError),
   #[error("Rule contains invalid regex matcher.")]
   WrongRegex(#[from] RegexMatcherError),
   #[error("Rule contains invalid matches reference.")]
   MatchesReference(#[from] ReferentRuleError),
+  #[error("Rule contains invalid range matcher.")]
+  InvalidRange(#[from] RangeMatcherError),
   #[error("field is only supported in has/inside.")]
   FieldNotSupported,
+  #[error("Relational rule contains invalid field {0}.")]
+  InvalidField(String),
 }
 
 // TODO: implement positive/non positive
@@ -357,8 +470,22 @@ fn deserialze_atomic_rule<L: Language>(
   if let Some(pattern) = atomic.pattern {
     rules.push(match pattern {
       PatternStyle::Str(pat) => R::Pattern(Pattern::try_new(&pat, env.lang.clone())?),
-      PatternStyle::Contextual { context, selector } => {
-        R::Pattern(Pattern::contextual(&context, &selector, env.lang.clone())?)
+      PatternStyle::Contextual {
+        context,
+        selector,
+        strictness,
+      } => {
+        let pattern = if let Some(selector) = selector {
+          Pattern::contextual(&context, &selector, env.lang.clone())?
+        } else {
+          Pattern::try_new(&context, env.lang.clone())?
+        };
+        let pattern = if let Some(strictness) = strictness {
+          pattern.with_strictness(strictness.into())
+        } else {
+          pattern
+        };
+        R::Pattern(pattern)
       }
     });
   }
@@ -367,6 +494,12 @@ fn deserialze_atomic_rule<L: Language>(
   }
   if let Some(regex) = atomic.regex {
     rules.push(R::Regex(RegexMatcher::try_new(&regex)?));
+  }
+  if let Some(nth_child) = atomic.nth_child {
+    rules.push(R::NthChild(NthChild::try_new(nth_child, env)?));
+  }
+  if let Some(range) = atomic.range {
+    rules.push(R::Range(RangeMatcher::try_new(range.start, range.end)?));
   }
   Ok(())
 }
@@ -502,5 +635,56 @@ inside:
     let rules = rules.inner();
     assert!(rules[0].is_atomic());
     assert!(rules[1].is_relational());
+  }
+
+  #[test]
+  fn test_defined_vars() {
+    let src = r"
+pattern: var $A = 123
+inside:
+  pattern: var $B = 456
+";
+    let rule: SerializableRule = from_str(src).expect("cannot parse rule");
+    let env = DeserializeEnv::new(TypeScript::Tsx);
+    let rule = deserialize_rule(rule, &env).expect("should deserialize");
+    assert_eq!(rule.defined_vars(), ["A", "B"].into_iter().collect());
+  }
+
+  #[test]
+  fn test_issue_1164() {
+    let src = r"
+    kind: statement_block
+    has:
+      pattern: this.$A = promise()
+      stopBy: end";
+    let rule: SerializableRule = from_str(src).expect("cannot parse rule");
+    let env = DeserializeEnv::new(TypeScript::Tsx);
+    let rule = deserialize_rule(rule, &env).expect("should deserialize");
+    let root = TypeScript::Tsx.ast_grep(
+      "if (a) {
+      this.a = b;
+      this.d = promise()
+    }",
+    );
+    assert!(root.root().find(rule).is_some());
+  }
+
+  #[test]
+  fn test_issue_1225() {
+    let src = r"
+    kind: statement_block
+    has:
+      pattern: $A
+      regex: const";
+    let rule: SerializableRule = from_str(src).expect("cannot parse rule");
+    let env = DeserializeEnv::new(TypeScript::Tsx);
+    let rule = deserialize_rule(rule, &env).expect("should deserialize");
+    let root = TypeScript::Tsx.ast_grep(
+      "{
+        let x = 1;
+        const z = 9;
+      }",
+    );
+    assert!(root.root().find(rule).is_some());
   }
 }

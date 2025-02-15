@@ -88,6 +88,7 @@ pub trait Doc: Clone {
     let lang = self.get_lang().get_ts_language();
     parse_lang(|p| source.parse_tree_sitter(p, old_tree), lang)
   }
+  fn clone_with_lang(&self, lang: Self::Lang) -> Self;
   /// TODO: are we paying too much to support str as Pattern/Replacer??
   /// this method converts string to Doc, so that we can support using
   /// string as replacer/searcher. Natively.
@@ -124,6 +125,9 @@ impl<L: Language> Doc for StrDoc<L> {
   fn from_str(src: &str, lang: L) -> Self {
     Self::new(src, lang)
   }
+  fn clone_with_lang(&self, lang: Self::Lang) -> Self {
+    Self::new(&self.src, lang)
+  }
 }
 
 pub trait Content: Sized {
@@ -142,6 +146,8 @@ pub trait Content: Sized {
   /// Used for string replacement. We need this for
   /// transformation.
   fn encode_bytes(bytes: &[Self::Underlying]) -> Cow<str>;
+  /// Get the character column at the given position
+  fn get_char_column(&self, column: usize, offset: usize) -> usize;
 }
 
 impl Content for String {
@@ -184,6 +190,25 @@ impl Content for String {
   }
   fn encode_bytes(bytes: &[Self::Underlying]) -> Cow<str> {
     String::from_utf8_lossy(bytes)
+  }
+
+  /// This is an O(n) operation. We assume the col will not be a
+  /// huge number in reality. This may be problematic for special
+  /// files like compressed js
+  fn get_char_column(&self, _col: usize, offset: usize) -> usize {
+    let src = self.as_bytes();
+    let mut col = 0;
+    // TODO: is it possible to use SIMD here???
+    for &b in src[..offset].iter().rev() {
+      if b == b'\n' {
+        break;
+      }
+      // https://en.wikipedia.org/wiki/UTF-8#Description
+      if b & 0b1100_0000 != 0b1000_0000 {
+        col += 1;
+      }
+    }
+    col
   }
 }
 

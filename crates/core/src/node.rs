@@ -9,6 +9,42 @@ type Edit<D> = E<<D as Doc>::Source>;
 
 use std::borrow::Cow;
 
+/// Represents a position in the source code.
+/// The line and column are zero-based, character offsets.
+/// It is different from tree-sitter's position which is zero-based `byte` offsets.
+/// Note, accessing `column` is O(n) operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+  /// zero-based line offset. Text encoding does not matter.
+  line: usize,
+  /// zero-based BYTE offset instead of character offset
+  byte_column: usize,
+  /// byte offset of this position
+  byte_offset: usize,
+}
+
+impl Position {
+  fn new(line: u32, byte_column: u32, byte_offset: u32) -> Self {
+    Self {
+      line: line as usize,
+      byte_column: byte_column as usize,
+      byte_offset: byte_offset as usize,
+    }
+  }
+  pub fn line(&self) -> usize {
+    self.line
+  }
+  /// TODO: return unicode character offset
+  pub fn column<D: Doc>(&self, node: &Node<D>) -> usize {
+    let source = node.root.doc.get_source();
+    source.get_char_column(self.byte_column, self.byte_offset)
+  }
+  /// Convert to tree-sitter's Point
+  pub fn ts_point(&self) -> tree_sitter::Point {
+    tree_sitter::Point::new(self.line as u32, self.byte_column as u32)
+  }
+}
+
 /// Represents [`tree_sitter::Tree`] and owns source string
 /// Note: Root is generic against [`Language`](crate::language::Language)
 #[derive(Clone)]
@@ -86,6 +122,27 @@ impl<D: Doc> Root<D> {
     debug_assert!(self.check_lineage(&node.inner));
     node.root = self;
   }
+
+  pub fn get_injections<F: Fn(&str) -> Option<D::Lang>>(&self, get_lang: F) -> Vec<Root<D>> {
+    let root = self.root();
+    let range = self.lang().extract_injections(root);
+    let roots = range
+      .into_iter()
+      .filter_map(|(lang, ranges)| {
+        let lang = get_lang(&lang)?;
+        let source = self.doc.get_source();
+        let mut parser = tree_sitter::Parser::new().ok()?;
+        parser.set_included_ranges(&ranges).ok()?;
+        parser.set_language(&lang.get_ts_language()).ok()?;
+        let tree = source.parse_tree_sitter(&mut parser, None).ok()?;
+        tree.map(|t| Self {
+          inner: t,
+          doc: self.doc.clone_with_lang(lang),
+        })
+      })
+      .collect();
+    roots
+  }
 }
 
 /// 'r represents root lifetime
@@ -118,7 +175,7 @@ impl<'tree, D: Doc> Iterator for NodeWalker<'tree, D> {
   }
 }
 
-impl<'tree, D: Doc> ExactSizeIterator for NodeWalker<'tree, D> {
+impl<D: Doc> ExactSizeIterator for NodeWalker<'_, D> {
   fn len(&self) -> usize {
     self.count
   }
@@ -163,15 +220,17 @@ impl<'r, D: Doc> Node<'r, D> {
   }
 
   /// Nodes' start position in terms of zero-based rows and columns.
-  pub fn start_pos(&self) -> (usize, usize) {
+  pub fn start_pos(&self) -> Position {
     let pos = self.inner.start_position();
-    (pos.row() as usize, pos.column() as usize)
+    let byte = self.inner.start_byte();
+    Position::new(pos.row(), pos.column(), byte)
   }
 
   /// Nodes' end position in terms of rows and columns.
-  pub fn end_pos(&self) -> (usize, usize) {
+  pub fn end_pos(&self) -> Position {
     let pos = self.inner.end_position();
-    (pos.row() as usize, pos.column() as usize)
+    let byte = self.inner.end_byte();
+    Position::new(pos.row(), pos.column(), byte)
   }
 
   pub fn text(&self) -> Cow<'r, str> {
@@ -231,7 +290,7 @@ impl<'r, L: Language> Node<'r, StrDoc<L>> {
       matched: self.text(),
       leading: &source[leading..start],
       trailing: &source[end..trailing],
-      start_line: self.start_pos().0 - offset,
+      start_line: self.start_pos().line() - offset,
     }
   }
 
@@ -243,7 +302,7 @@ impl<'r, L: Language> Node<'r, StrDoc<L>> {
 /**
  * Corresponds to inside/has/precedes/follows
  */
-impl<'r, D: Doc> Node<'r, D> {
+impl<D: Doc> Node<'_, D> {
   pub fn matches<M: Matcher<D::Lang>>(&self, m: M) -> bool {
     m.match_node(self.clone()).is_some()
   }
@@ -308,11 +367,15 @@ impl<'r, D: Doc> Node<'r, D> {
   }
 
   pub fn field(&self, name: &str) -> Option<Self> {
-    let mut cursor = self.inner.walk();
-    let inner = self
-      .inner
-      .children_by_field_name(name, &mut cursor)
-      .next()?;
+    let inner = self.inner.child_by_field_name(name)?;
+    Some(Node {
+      inner,
+      root: self.root,
+    })
+  }
+
+  pub fn child_by_field_id(&self, field_id: u16) -> Option<Self> {
+    let inner = self.inner.child_by_field_id(field_id)?;
     Some(Node {
       inner,
       root: self.root,
@@ -375,9 +438,6 @@ impl<'r, D: Doc> Node<'r, D> {
   // NOTE: Need go to parent first, then move to current node by byte offset.
   // This is because tree_sitter cursor is scoped to the starting node.
   // See https://github.com/tree-sitter/tree-sitter/issues/567
-  // TODO: remove this target_arch dependent code branch
-  // TODO: we need to add goto_first_child_for_byte in web-tree-sitter
-  // https://github.com/tree-sitter/tree-sitter/discussions/2288
   #[cfg(not(target_arch = "wasm32"))]
   pub fn next_all(&self) -> impl Iterator<Item = Node<'r, D>> + '_ {
     // if root is none, use self as fallback to return a type-stable Iterator
@@ -393,9 +453,7 @@ impl<'r, D: Doc> Node<'r, D> {
     })
   }
 
-  // TODO: remove this target_arch dependent code branch
-  // TODO: we need to add goto_first_child_for_byte in web-tree-sitter
-  // https://github.com/tree-sitter/tree-sitter/discussions/2288
+  // wasm32 has wrong goto_first_child_for_byte
   #[cfg(target_arch = "wasm32")]
   pub fn next_all(&self) -> impl Iterator<Item = Node<'r, D>> + '_ {
     let mut node = self.clone();
@@ -416,8 +474,23 @@ impl<'r, D: Doc> Node<'r, D> {
     })
   }
 
-  // TODO: use cursor to optimize clone.
-  // investigate why tree_sitter cursor cannot goto next_sibling
+  #[cfg(not(target_arch = "wasm32"))]
+  pub fn prev_all(&self) -> impl Iterator<Item = Node<'r, D>> + '_ {
+    // if root is none, use self as fallback to return a type-stable Iterator
+    let node = self.parent().unwrap_or_else(|| self.clone());
+    let mut cursor = node.inner.walk();
+    cursor.goto_first_child_for_byte(self.inner.start_byte());
+    std::iter::from_fn(move || {
+      if cursor.goto_previous_sibling() {
+        Some(self.root.adopt(cursor.node()))
+      } else {
+        None
+      }
+    })
+  }
+
+  // wasm32 has wrong goto_first_child_for_byte
+  #[cfg(target_arch = "wasm32")]
   pub fn prev_all(&self) -> impl Iterator<Item = Node<'r, D>> + '_ {
     let mut node = self.clone();
     std::iter::from_fn(move || {
@@ -443,7 +516,7 @@ impl<'r, D: Doc> Node<'r, D> {
 }
 
 /// Tree manipulation API
-impl<'r, D: Doc> Node<'r, D> {
+impl<D: Doc> Node<'_, D> {
   pub fn replace<M: Matcher<D::Lang>, R: Replacer<D>>(
     &self,
     matcher: M,
@@ -633,5 +706,62 @@ if (a) {
     let root = root.root();
     let node = root.find("Some(2);").expect("should exist");
     assert!(node.follows("Some(Some(1));"));
+  }
+
+  #[test]
+  fn test_field() {
+    let root = Tsx.ast_grep("class A{}");
+    let root = root.root();
+    let node = root.find("class $C {}").expect("should exist");
+    assert!(node.field("name").is_some());
+    assert!(node.field("none").is_none());
+  }
+  #[test]
+  fn test_child_by_field_id() {
+    let root = Tsx.ast_grep("class A{}");
+    let root = root.root();
+    let node = root.find("class $C {}").expect("should exist");
+    let id = Tsx.get_ts_language().field_id_for_name("name").unwrap();
+    assert!(node.child_by_field_id(id).is_some());
+    assert!(node.child_by_field_id(id + 1).is_none());
+  }
+
+  #[test]
+  fn test_remove() {
+    let root = Tsx.ast_grep("Some(Some(1)); Some(2);");
+    let root = root.root();
+    let node = root.find("Some(2);").expect("should exist");
+    let edit = node.remove();
+    assert_eq!(edit.position, 15);
+    assert_eq!(edit.deleted_length, 8);
+  }
+
+  #[test]
+  fn test_ascii_pos() {
+    let root = Tsx.ast_grep("a");
+    let root = root.root();
+    let node = root.find("$A").expect("should exist");
+    assert_eq!(node.start_pos().line(), 0);
+    assert_eq!(node.start_pos().column(&node), 0);
+    assert_eq!(node.end_pos().line(), 0);
+    assert_eq!(node.end_pos().column(&node), 1);
+  }
+
+  #[test]
+  fn test_unicode_pos() {
+    let root = Tsx.ast_grep("🦀");
+    let root = root.root();
+    let node = root.find("$A").expect("should exist");
+    assert_eq!(node.start_pos().line(), 0);
+    assert_eq!(node.start_pos().column(&node), 0);
+    assert_eq!(node.end_pos().line(), 0);
+    assert_eq!(node.end_pos().column(&node), 1);
+    let root = Tsx.ast_grep("\n  🦀🦀");
+    let root = root.root();
+    let node = root.find("$A").expect("should exist");
+    assert_eq!(node.start_pos().line(), 1);
+    assert_eq!(node.start_pos().column(&node), 2);
+    assert_eq!(node.end_pos().line(), 1);
+    assert_eq!(node.end_pos().column(&node), 4);
   }
 }

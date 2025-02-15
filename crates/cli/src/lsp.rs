@@ -1,28 +1,41 @@
-use crate::config::{find_rules, register_custom_language};
-use crate::error::ErrorContext as EC;
+use crate::config::ProjectConfig;
+use crate::utils::ErrorContext as EC;
 use anyhow::{Context, Result};
 use ast_grep_lsp::{Backend, LspService, Server};
+use clap::Args;
 
-async fn run_language_server_impl() -> Result<()> {
+#[derive(Args)]
+pub struct LspArg {}
+
+async fn run_language_server_impl(_arg: LspArg, project: Result<ProjectConfig>) -> Result<()> {
   // env_logger::init();
-  register_custom_language(None)?;
+  // TODO: move this error to client
+  let project_config = project?;
   let stdin = tokio::io::stdin();
   let stdout = tokio::io::stdout();
-  let config = find_rules(None, None).unwrap_or_default();
-
-  let (service, socket) = LspService::build(|client| Backend::new(client, config))
-    .custom_method("ast-grep/search", Backend::search)
-    .finish();
+  let config_result = project_config.find_rules(Default::default());
+  let config_result_std: std::result::Result<_, String> = config_result
+    .map_err(|e| {
+      // convert anyhow::Error to String with chain of causes
+      e.chain()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(". ")
+    })
+    .map(|r| r.0);
+  let config_base = project_config.project_dir;
+  let (service, socket) =
+    LspService::build(|client| Backend::new(client, config_base, config_result_std)).finish();
   Server::new(stdin, stdout, socket).serve(service).await;
   Ok(())
 }
 
-pub fn run_language_server() -> Result<()> {
+pub fn run_language_server(arg: LspArg, project: Result<ProjectConfig>) -> Result<()> {
   tokio::runtime::Builder::new_multi_thread()
     .enable_all()
     .build()
     .context(EC::StartLanguageServer)?
-    .block_on(async { run_language_server_impl().await })
+    .block_on(async { run_language_server_impl(arg, project).await })
 }
 
 #[cfg(test)]
@@ -32,6 +45,7 @@ mod test {
   #[test]
   #[ignore = "test lsp later"]
   fn test_lsp_start() {
-    assert!(run_language_server().is_err())
+    let arg = LspArg {};
+    assert!(run_language_server(arg, Err(anyhow::anyhow!("error"))).is_err())
   }
 }

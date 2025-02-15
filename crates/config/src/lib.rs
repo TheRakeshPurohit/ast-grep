@@ -1,3 +1,4 @@
+mod check_var;
 mod combined;
 mod fixer;
 mod maybe;
@@ -12,15 +13,14 @@ use serde_yaml::{with::singleton_map_recursive::deserialize, Deserializer, Error
 
 use ast_grep_core::language::Language;
 
-pub use combined::CombinedScan;
+pub use combined::{CombinedScan, PreScan};
 pub use fixer::Fixer;
 pub use rule::referent_rule::GlobalRules;
 pub use rule::DeserializeEnv;
 pub use rule::{Rule, RuleSerializeError, SerializableRule};
 pub use rule_collection::RuleCollection;
-pub use rule_config::{
-  RuleConfig, RuleConfigError, RuleCore, SerializableRuleConfig, SerializableRuleCore, Severity,
-};
+pub use rule_config::{RuleConfig, RuleConfigError, SerializableRuleConfig, Severity};
+pub use rule_core::{RuleCore, RuleCoreError, SerializableRuleCore};
 pub use transform::Transformation;
 
 pub fn from_str<'de, T: Deserialize<'de>>(s: &'de str) -> Result<T, YamlError> {

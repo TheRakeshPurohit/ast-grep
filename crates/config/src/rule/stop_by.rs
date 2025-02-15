@@ -8,17 +8,25 @@ use schemars::JsonSchema;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashSet;
 use std::fmt;
 
 // NB StopBy's JsonSchema is changed in xtask/schema.rs
 // revise schema is easier than manually implementation
-#[derive(Serialize, Clone, Default, JsonSchema)]
+#[derive(Clone, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum SerializableStopBy {
   #[default]
   Neighbor,
   End,
   Rule(SerializableRule),
+}
+
+impl SerializableStopBy {
+  /// String key used for serializing the Neighbor variant
+  const NEIGHBOR_KEY: &str = "neighbor";
+  /// String key used for serializing the End variant
+  const END_KEY: &str = "end";
 }
 
 struct StopByVisitor;
@@ -33,10 +41,12 @@ impl<'de> Visitor<'de> for StopByVisitor {
     E: de::Error,
   {
     match value {
-      "neighbor" => Ok(SerializableStopBy::Neighbor),
-      "end" => Ok(SerializableStopBy::End),
+      SerializableStopBy::NEIGHBOR_KEY => Ok(SerializableStopBy::Neighbor),
+      SerializableStopBy::END_KEY => Ok(SerializableStopBy::End),
       v => Err(de::Error::custom(format!(
-        "unknown variant `{v}`, expected `neighbor`, `end` or a rule object",
+        "unknown variant `{v}`, expected `{}`, `{}` or a rule object",
+        SerializableStopBy::NEIGHBOR_KEY,
+        SerializableStopBy::END_KEY,
       ))),
     }
   }
@@ -59,6 +69,19 @@ impl<'de> Deserialize<'de> for SerializableStopBy {
   }
 }
 
+impl Serialize for SerializableStopBy {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    match self {
+      SerializableStopBy::Neighbor => serializer.serialize_str(SerializableStopBy::NEIGHBOR_KEY),
+      SerializableStopBy::End => serializer.serialize_str(SerializableStopBy::END_KEY),
+      SerializableStopBy::Rule(rule) => rule.serialize(serializer),
+    }
+  }
+}
+
 pub enum StopBy<L: Language> {
   Neighbor,
   End,
@@ -76,6 +99,22 @@ impl<L: Language> StopBy<L> {
       S::End => StopBy::End,
       S::Rule(r) => StopBy::Rule(env.deserialize_rule(r)?),
     })
+  }
+
+  pub fn defined_vars(&self) -> HashSet<&str> {
+    match self {
+      StopBy::Rule(rule) => rule.defined_vars(),
+      StopBy::End => HashSet::new(),
+      StopBy::Neighbor => HashSet::new(),
+    }
+  }
+
+  pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
+    match self {
+      StopBy::Rule(rule) => rule.verify_util(),
+      StopBy::End => Ok(()),
+      StopBy::Neighbor => Ok(()),
+    }
   }
 }
 
@@ -124,6 +163,7 @@ fn inclusive_until<D: Doc>(rule: &Rule<D::Lang>) -> impl FnMut(&Node<D>) -> bool
 mod test {
   use super::*;
   use crate::from_str;
+  use crate::test::TypeScript;
 
   #[test]
   fn test_relational() {
@@ -167,5 +207,44 @@ inside:
     assert!(err.contains("ddd"));
     let err = cast_err!(to_stop_by("pattern: 1233"));
     assert!(err.to_string().contains("variant"));
+  }
+
+  fn parse_stop_by(src: &str) -> StopBy<TypeScript> {
+    let stop_by = to_stop_by(src).expect("cannot parse stopBy");
+    StopBy::try_from(stop_by, &DeserializeEnv::new(TypeScript::Tsx)).expect("cannot convert")
+  }
+
+  #[test]
+  fn test_stop_by_no_defined_vars() {
+    let stop_by = parse_stop_by("neighbor");
+    assert!(stop_by.defined_vars().is_empty());
+    let stop_by = parse_stop_by("end");
+    assert!(stop_by.defined_vars().is_empty());
+  }
+
+  #[test]
+  fn test_stop_by_defined_vars() {
+    let stop_by = parse_stop_by("kind: class");
+    assert_eq!(stop_by.defined_vars(), HashSet::new());
+    let stop_by = parse_stop_by("pattern: $A");
+    assert_eq!(stop_by.defined_vars(), ["A"].into_iter().collect());
+  }
+
+  #[test]
+  fn test_serialization_deserialization_symmetry() {
+    let stop = to_stop_by("'neighbor'").expect("cannot parse stopBy");
+    let serialized = serde_yaml::to_string(&stop).expect("cannot serialize stopBy");
+    let deserialized = to_stop_by(&serialized).expect("cannot parse stopBy");
+    assert!(matches!(deserialized, SerializableStopBy::Neighbor));
+
+    let stop = to_stop_by("'end'").expect("cannot parse stopBy");
+    let serialized = serde_yaml::to_string(&stop).expect("cannot serialize stopBy");
+    let deserialized = to_stop_by(&serialized).expect("cannot parse stopBy");
+    assert!(matches!(deserialized, SerializableStopBy::End));
+
+    let stop = to_stop_by("kind: some-kind").expect("cannot parse stopBy");
+    let serialized = serde_yaml::to_string(&stop).expect("cannot serialize stopBy");
+    let deserialized = to_stop_by(&serialized).expect("cannot parse stopBy");
+    assert!(matches!(deserialized, SerializableStopBy::Rule(_)));
   }
 }

@@ -1,85 +1,62 @@
 #![cfg(not(feature = "napi-noop-in-unit-test"))]
 
 mod doc;
-mod fe_lang;
+mod find_files;
+mod napi_lang;
 mod sg_node;
 
-use ast_grep_config::RuleCore;
-use ast_grep_core::language::Language;
-use ast_grep_core::pinned::{NodeData, PinnedNodeData};
-use ast_grep_core::{AstGrep, NodeMatch};
-use ignore::{WalkBuilder, WalkParallel, WalkState};
-use napi::anyhow::{anyhow, Context, Result as Ret};
+use ast_grep_core::{AstGrep, Language};
+use ast_grep_language::SupportLang;
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{JsNumber, Task};
 use napi_derive::napi;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::channel;
+use napi_lang::register_dynamic_language as register_dynamic_language_impl;
 
 use doc::{JsDoc, NapiConfig};
-use fe_lang::{build_files, FrontEndLanguage, LangOption};
-use sg_node::{SgNode, SgRoot};
+use find_files::{find_in_files_impl, FindConfig, FindInFiles, ParseAsync};
+use napi_lang::NapiLang;
+use sg_node::SgRoot;
+
+pub use find_files::parse_files;
 
 macro_rules! impl_lang_mod {
-    ($name: ident, $lang: ident) =>  {
+  ($name: ident, $lang: ident) => {
+    #[napi]
+    pub mod $name {
+      use super::*;
+
       #[napi]
-      pub mod $name {
-        use super::*;
-        use super::FrontEndLanguage::*;
+      pub fn parse(src: String) -> SgRoot {
+        parse_with_lang(SupportLang::$lang.to_string(), src).expect("parse failed")
+      }
 
-        /// Parse a string to an ast-grep instance
-        #[napi]
-        pub fn parse(src: String) -> SgRoot {
-          let doc = JsDoc::new(src, $lang);
-          SgRoot(AstGrep::doc(doc), "anonymous".into())
-        }
-
-        /// Parse a string to an ast-grep instance asynchronously in threads.
-        /// It utilize multiple CPU cores when **concurrent processing sources**.
-        /// However, spawning excessive many threads may backfire.
-        /// Please refer to libuv doc, nodejs' underlying runtime
-        /// for its default behavior and performance tuning tricks.
-        #[napi(ts_return_type = "Promise<SgRoot>")]
-        pub fn parse_async(src: String) -> AsyncTask<ParseAsync> {
-          AsyncTask::new(ParseAsync {
-            src, lang: $lang,
-          })
-        }
-        /// Get the `kind` number from its string name.
-        #[napi]
-        pub fn kind(kind_name: String) -> u16 {
-          $lang.get_ts_language().id_for_node_kind(&kind_name, /* named */ true)
-        }
-        /// Compile a string to ast-grep Pattern.
-        #[napi]
-        pub fn pattern(pattern: String) -> NapiConfig {
-          NapiConfig {
-            rule: serde_json::json!({
-              "pattern": pattern,
-            }),
-            constraints: None,
-            language: Some($lang),
-            utils: None,
-            transform: None,
-          }
-        }
-
-        /// Discover and parse multiple files in Rust.
-        /// `config` specifies the file path and matcher.
-        /// `callback` will receive matching nodes found in a file.
-        #[napi(
-          ts_args_type = "config: FindConfig, callback: (err: null | Error, result: SgNode[]) => void",
-          ts_return_type = "Promise<number>"
-        )]
-        pub fn find_in_files(config: FindConfig, callback: JsFunction) -> Result<AsyncTask<FindInFiles>> {
-          find_in_files_impl($lang, config, callback)
-        }
+      #[napi]
+      pub fn parse_async(src: String) -> Result<AsyncTask<ParseAsync>> {
+        parse_async_with_lang(SupportLang::$lang.to_string(), src)
+      }
+      #[napi]
+      pub fn kind(kind_name: String) -> Result<u16> {
+        kind_with_lang(SupportLang::$lang.to_string(), kind_name)
+      }
+      #[napi]
+      pub fn pattern(pattern: String) -> NapiConfig {
+        pattern_with_lang(SupportLang::$lang.to_string(), pattern)
+      }
+      #[napi]
+      pub fn find_in_files(
+        config: FindConfig,
+        callback: JsFunction,
+      ) -> Result<AsyncTask<FindInFiles>> {
+        find_in_files_impl(SupportLang::$lang.into(), config, callback)
       }
     }
+  };
 }
 
+// for name conflict in mod
+use kind as kind_with_lang;
+use parse as parse_with_lang;
+use parse_async as parse_async_with_lang;
+use pattern as pattern_with_lang;
 impl_lang_mod!(html, Html);
 impl_lang_mod!(js, JavaScript);
 impl_lang_mod!(jsx, JavaScript);
@@ -87,231 +64,66 @@ impl_lang_mod!(ts, TypeScript);
 impl_lang_mod!(tsx, Tsx);
 impl_lang_mod!(css, Css);
 
-pub struct ParseAsync {
-  src: String,
-  lang: FrontEndLanguage,
+/// Parse a string to an ast-grep instance
+#[napi]
+pub fn parse(lang: String, src: String) -> Result<SgRoot> {
+  let doc = JsDoc::new(src, lang.parse()?);
+  Ok(SgRoot(AstGrep::doc(doc), "anonymous".into()))
 }
 
-impl Task for ParseAsync {
-  type Output = SgRoot;
-  type JsValue = SgRoot;
-
-  fn compute(&mut self) -> Result<Self::Output> {
-    let src = std::mem::take(&mut self.src);
-    let doc = JsDoc::new(src, self.lang);
-    Ok(SgRoot(AstGrep::doc(doc), "anonymous".into()))
-  }
-  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-    Ok(output)
-  }
+/// Parse a string to an ast-grep instance asynchronously in threads.
+/// It utilize multiple CPU cores when **concurrent processing sources**.
+/// However, spawning excessive many threads may backfire.
+/// Please refer to libuv doc, nodejs' underlying runtime
+/// for its default behavior and performance tuning tricks.
+#[napi]
+pub fn parse_async(lang: String, src: String) -> Result<AsyncTask<ParseAsync>> {
+  let lang = lang.parse()?;
+  Ok(AsyncTask::new(ParseAsync { src, lang }))
 }
 
-type Entry = std::result::Result<ignore::DirEntry, ignore::Error>;
-
-pub struct IterateFiles<D> {
-  walk: WalkParallel,
-  lang_option: LangOption,
-  tsfn: D,
-  producer: fn(&D, Entry, &LangOption) -> Ret<bool>,
+/// Get the `kind` number from its string name.
+#[napi]
+pub fn kind(lang: String, kind_name: String) -> Result<u16> {
+  let lang: NapiLang = lang.parse()?;
+  let kind = lang
+    .get_ts_language()
+    .id_for_node_kind(&kind_name, /* named */ true);
+  Ok(kind)
 }
 
-impl<T: 'static + Send + Sync> Task for IterateFiles<T> {
-  type Output = u32;
-  type JsValue = JsNumber;
-
-  fn compute(&mut self) -> Result<Self::Output> {
-    let tsfn = &self.tsfn;
-    let file_count = AtomicU32::new(0);
-    let (tx, rx) = channel();
-    let producer = self.producer;
-    let walker = std::mem::replace(&mut self.walk, WalkBuilder::new(".").build_parallel());
-    walker.run(|| {
-      let tx = tx.clone();
-      let file_count = &file_count;
-      let lang_option = &self.lang_option;
-      Box::new(move |entry| match producer(tsfn, entry, lang_option) {
-        Ok(true) => {
-          // file is sent to JS thread, increment file count
-          if tx.send(()).is_ok() {
-            file_count.fetch_add(1, Ordering::AcqRel);
-            WalkState::Continue
-          } else {
-            WalkState::Quit
-          }
-        }
-        Ok(false) => WalkState::Continue,
-        Err(_) => WalkState::Skip,
-      })
-    });
-    // Drop the last sender to stop `rx` waiting for message.
-    // The program will not complete if we comment this out.
-    drop(tx);
-    while rx.recv().is_ok() {
-      // pass
-    }
-    Ok(file_count.load(Ordering::Acquire))
-  }
-  fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
-    env.create_uint32(output)
+/// Compile a string to ast-grep Pattern.
+#[napi]
+pub fn pattern(lang: String, pattern: String) -> NapiConfig {
+  NapiConfig {
+    rule: serde_json::json!({
+      "pattern": pattern,
+    }),
+    constraints: None,
+    language: Some(lang),
+    utils: None,
+    transform: None,
   }
 }
 
-// See https://github.com/ast-grep/ast-grep/issues/206
-// NodeJS has a 1000 file limitation on sync iteration count.
-// https://github.com/nodejs/node/blob/8ba54e50496a6a5c21d93133df60a9f7cb6c46ce/src/node_api.cc#L336
-const THREAD_FUNC_QUEUE_SIZE: usize = 1000;
-
-type ParseFiles = IterateFiles<ThreadsafeFunction<SgRoot, ErrorStrategy::CalleeHandled>>;
-
-#[napi(object)]
-pub struct FileOption {
-  pub paths: Vec<String>,
-  pub language_globs: HashMap<String, Vec<String>>,
-}
-
-#[napi(ts_return_type = "Promise<number>")]
-pub fn parse_files(
-  paths: Either<Vec<String>, FileOption>,
-  #[napi(ts_arg_type = "(err: null | Error, result: SgRoot) => void")] callback: JsFunction,
-) -> Result<AsyncTask<ParseFiles>> {
-  let tsfn: ThreadsafeFunction<SgRoot, ErrorStrategy::CalleeHandled> =
-    callback.create_threadsafe_function(THREAD_FUNC_QUEUE_SIZE, |ctx| Ok(vec![ctx.value]))?;
-  let (paths, globs) = match paths {
-    Either::A(v) => (v, HashMap::new()),
-    Either::B(FileOption {
-      paths,
-      language_globs,
-    }) => (paths, FrontEndLanguage::lang_globs(language_globs)),
-  };
-  let walk = build_files(paths, &globs)?;
-  Ok(AsyncTask::new(ParseFiles {
-    walk,
-    tsfn,
-    lang_option: LangOption::infer(&globs),
-    producer: call_sg_root,
-  }))
-}
-
-// returns if the entry is a file and sent to JavaScript queue
-fn call_sg_root(
-  tsfn: &ThreadsafeFunction<SgRoot, ErrorStrategy::CalleeHandled>,
-  entry: std::result::Result<ignore::DirEntry, ignore::Error>,
-  lang_option: &LangOption,
-) -> Ret<bool> {
-  let entry = entry?;
-  if !entry
-    .file_type()
-    .context("could not use stdin as file")?
-    .is_file()
-  {
-    return Ok(false);
-  }
-  let (root, path) = get_root(entry, lang_option)?;
-  let sg = SgRoot(root, path);
-  tsfn.call(Ok(sg), ThreadsafeFunctionCallMode::Blocking);
-  Ok(true)
-}
-
-fn get_root(entry: ignore::DirEntry, lang_option: &LangOption) -> Ret<(AstGrep<JsDoc>, String)> {
-  let path = entry.into_path();
-  let file_content = std::fs::read_to_string(&path)?;
-  let lang = lang_option
-    .get_lang(&path)
-    .context(anyhow!("file not recognized"))?;
-  let doc = JsDoc::new(file_content, lang);
-  Ok((AstGrep::doc(doc), path.to_string_lossy().into()))
-}
-
-type FindInFiles = IterateFiles<(
-  ThreadsafeFunction<PinnedNodes, ErrorStrategy::CalleeHandled>,
-  RuleCore<FrontEndLanguage>,
-)>;
-
-pub struct PinnedNodes(
-  PinnedNodeData<JsDoc, Vec<NodeMatch<'static, JsDoc>>>,
-  String,
-);
-unsafe impl Send for PinnedNodes {}
-unsafe impl Sync for PinnedNodes {}
-
-#[napi(object)]
-pub struct FindConfig {
-  /// specify the file paths to recursively find files
-  pub paths: Vec<String>,
-  /// a Rule object to find what nodes will match
-  pub matcher: NapiConfig,
-  /// An list of pattern globs to treat of certain files in the specified language.
-  /// eg. ['*.vue', '*.svelte'] for html.findFiles, or ['*.ts'] for tsx.findFiles.
-  /// It is slightly different from https://ast-grep.github.io/reference/sgconfig.html#languageglobs
-  pub language_globs: Option<Vec<String>>,
-}
-
-fn find_in_files_impl(
-  lang: FrontEndLanguage,
+/// Discover and parse multiple files in Rust.
+/// `lang` specifies the language.
+/// `config` specifies the file path and matcher.
+/// `callback` will receive matching nodes found in a file.
+#[napi]
+pub fn find_in_files(
+  lang: String,
   config: FindConfig,
   callback: JsFunction,
 ) -> Result<AsyncTask<FindInFiles>> {
-  let tsfn = callback.create_threadsafe_function(THREAD_FUNC_QUEUE_SIZE, |ctx| {
-    from_pinned_data(ctx.value, ctx.env)
-  })?;
-  let FindConfig {
-    paths,
-    matcher,
-    language_globs,
-  } = config;
-  let rule = matcher.parse_with(lang)?;
-  let walk = lang.find_files(paths, language_globs)?;
-  Ok(AsyncTask::new(FindInFiles {
-    walk,
-    tsfn: (tsfn, rule),
-    lang_option: LangOption::Specified(lang),
-    producer: call_sg_node,
-  }))
+  let lang: NapiLang = lang.parse()?;
+  find_in_files_impl(lang, config, callback)
 }
 
-// TODO: optimize
-fn from_pinned_data(pinned: PinnedNodes, env: napi::Env) -> Result<Vec<Vec<SgNode>>> {
-  let (root, nodes) = pinned.0.into_raw();
-  let sg_root = SgRoot(AstGrep { inner: root }, pinned.1);
-  let reference = SgRoot::into_reference(sg_root, env)?;
-  let mut v = vec![];
-  for mut node in nodes {
-    let root_ref = reference.clone(env)?;
-    let sg_node = SgNode {
-      inner: root_ref.share_with(env, |root| {
-        let r = &root.0.inner;
-        node.visit_nodes(|n| unsafe { r.readopt(n) });
-        Ok(node)
-      })?,
-    };
-    v.push(sg_node);
-  }
-  Ok(vec![v])
-}
-
-fn call_sg_node(
-  (tsfn, rule): &(
-    ThreadsafeFunction<PinnedNodes, ErrorStrategy::CalleeHandled>,
-    RuleCore<FrontEndLanguage>,
-  ),
-  entry: std::result::Result<ignore::DirEntry, ignore::Error>,
-  lang_option: &LangOption,
-) -> Ret<bool> {
-  let entry = entry?;
-  if !entry
-    .file_type()
-    .context("could not use stdin as file")?
-    .is_file()
-  {
-    return Ok(false);
-  }
-  let (root, path) = get_root(entry, lang_option)?;
-  let mut pinned = PinnedNodeData::new(root.inner, |r| r.root().find_all(rule).collect());
-  let hits: &Vec<_> = pinned.get_data();
-  if hits.is_empty() {
-    return Ok(false);
-  }
-  let pinned = PinnedNodes(pinned, path);
-  tsfn.call(Ok(pinned), ThreadsafeFunctionCallMode::Blocking);
-  Ok(true)
+/// Register a dynamic language to ast-grep.
+/// `langs` is a Map of language name to its CustomLanguage registration.
+#[napi]
+pub fn register_dynamic_language(langs: serde_json::Value) -> Result<()> {
+  let langs = serde_json::from_value(langs)?;
+  register_dynamic_language_impl(langs)
 }

@@ -2,7 +2,6 @@ use crate::matcher::NodeMatch;
 use crate::node::{Node, Root};
 use crate::Doc;
 
-// TODO: refine comments
 // ast-grep Node contains a reference to Root. It implies that
 // node can be used only when the Root is valid and not dropped.
 // By default, tree-sitter Node<'r> is scoped by ast Root's lifetime
@@ -93,7 +92,11 @@ unsafe impl<D: Doc> NodeData<D> for NodeMatch<'static, D> {
   where
     F: FnMut(&mut Node<'_, D>),
   {
-    f(unsafe { self.get_node_mut() })
+    // update the matched Node
+    f(unsafe { self.get_node_mut() });
+    // update the meta variable captured
+    let env = self.get_env_mut();
+    env.visit_nodes(f);
   }
 }
 
@@ -107,7 +110,7 @@ unsafe impl<D: Doc> NodeData<D> for Vec<NodeMatch<'static, D>> {
     F: FnMut(&mut Node<'_, D>),
   {
     for n in self {
-      f(unsafe { n.get_node_mut() })
+      n.visit_nodes(&mut f)
     }
   }
 }

@@ -1,4 +1,4 @@
-use crate::FrontEndLanguage;
+use crate::napi_lang::NapiLang;
 
 use ast_grep_config::{DeserializeEnv, RuleCore, SerializableRuleCore};
 use ast_grep_core::source::{Content, Doc, Edit, TSParseError};
@@ -20,7 +20,8 @@ pub struct NapiConfig {
   /// See https://ast-grep.github.io/guide/rule-config.html#constraints
   pub constraints: Option<serde_json::Value>,
   /// Available languages: html, css, js, jsx, ts, tsx
-  pub language: Option<FrontEndLanguage>,
+  pub language: Option<String>,
+  /// transform is NOT useful in JavaScript. You can use JS code to directly transform the result.
   /// https://ast-grep.github.io/reference/yaml.html#transform
   pub transform: Option<serde_json::Value>,
   /// https://ast-grep.github.io/guide/rule-config/utility-rule.html
@@ -28,8 +29,7 @@ pub struct NapiConfig {
 }
 
 impl NapiConfig {
-  pub fn parse_with(self, language: FrontEndLanguage) -> NapiResult<RuleCore<FrontEndLanguage>> {
-    let lang = self.language.unwrap_or(language);
+  pub fn parse_with(self, lang: NapiLang) -> NapiResult<RuleCore<NapiLang>> {
     let rule = SerializableRuleCore {
       rule: serde_json::from_value(self.rule)?,
       constraints: self.constraints.map(serde_json::from_value).transpose()?,
@@ -102,6 +102,10 @@ impl Content for Wrapper {
     let s = String::from_utf16_lossy(bytes);
     Cow::Owned(s)
   }
+  fn get_char_column(&self, column: usize, _offset: usize) -> usize {
+    // utf-16 is 2 bytes per character, this is O(1) operation!
+    column / 2
+  }
 }
 
 fn pos_for_byte_offset(input: &[u16], byte_offset: usize) -> Point {
@@ -121,12 +125,12 @@ fn pos_for_byte_offset(input: &[u16], byte_offset: usize) -> Point {
 
 #[derive(Clone)]
 pub struct JsDoc {
-  lang: FrontEndLanguage,
+  lang: NapiLang,
   source: Wrapper,
 }
 
 impl JsDoc {
-  pub fn new(src: String, lang: FrontEndLanguage) -> Self {
+  pub fn new(src: String, lang: NapiLang) -> Self {
     let source = Wrapper {
       inner: src.encode_utf16().collect(),
     };
@@ -135,7 +139,7 @@ impl JsDoc {
 }
 
 impl Doc for JsDoc {
-  type Lang = FrontEndLanguage;
+  type Lang = NapiLang;
   type Source = Wrapper;
   fn parse(&self, old_tree: Option<&Tree>) -> std::result::Result<Tree, TSParseError> {
     let mut parser = Parser::new()?;
@@ -159,15 +163,22 @@ impl Doc for JsDoc {
   fn from_str(src: &str, lang: Self::Lang) -> Self {
     JsDoc::new(src.into(), lang)
   }
+  fn clone_with_lang(&self, lang: Self::Lang) -> Self {
+    JsDoc {
+      source: self.source.clone(),
+      lang,
+    }
+  }
 }
 
 #[cfg(test)]
 mod test {
   use super::*;
   use ast_grep_core::AstGrep;
+  use ast_grep_language::SupportLang;
   #[test]
   fn test_js_doc() {
-    let doc = JsDoc::new("console.log(123)".into(), FrontEndLanguage::JavaScript);
+    let doc = JsDoc::new("console.log(123)".into(), SupportLang::JavaScript.into());
     let grep = AstGrep::doc(doc);
     assert_eq!(grep.root().text(), "console.log(123)");
     let node = grep.root().find("console");
@@ -178,7 +189,7 @@ mod test {
   fn test_js_doc_single_node_replace() {
     let doc = JsDoc::new(
       "console.log(1 + 2 + 3)".into(),
-      FrontEndLanguage::JavaScript,
+      SupportLang::JavaScript.into(),
     );
     let mut grep = AstGrep::doc(doc);
     let edit = grep
@@ -193,7 +204,7 @@ mod test {
   fn test_js_doc_multiple_node_replace() {
     let doc = JsDoc::new(
       "console.log(1 + 2 + 3)".into(),
-      FrontEndLanguage::JavaScript,
+      SupportLang::JavaScript.into(),
     );
     let mut grep = AstGrep::doc(doc);
     let edit = grep

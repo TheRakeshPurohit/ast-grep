@@ -96,11 +96,8 @@ impl<L: Language + Eq> RuleCollection<L> {
     })
   }
 
-  pub fn for_path<P: AsRef<Path>>(&self, path: P) -> Vec<&RuleConfig<L>> {
+  pub fn get_rule_from_lang(&self, path: &Path, lang: L) -> Vec<&RuleConfig<L>> {
     let mut all_rules = vec![];
-    let Some(lang) = L::from_path(path.as_ref()) else {
-      return vec![];
-    };
     for rule in &self.tenured {
       if rule.lang == lang {
         all_rules = rule.rules.iter().collect();
@@ -108,13 +105,23 @@ impl<L: Language + Eq> RuleCollection<L> {
       }
     }
     all_rules.extend(self.contingent.iter().filter_map(|cont| {
-      if cont.rule.language == lang && cont.matches_path(path.as_ref()) {
+      if cont.rule.language == lang && cont.matches_path(path) {
         Some(&cont.rule)
       } else {
         None
       }
     }));
     all_rules
+  }
+
+  pub fn for_path<P: AsRef<Path>>(&self, path: P) -> Vec<&RuleConfig<L>> {
+    let path = path.as_ref();
+    let Some(lang) = L::from_path(path) else {
+      return vec![];
+    };
+    let mut ret = self.get_rule_from_lang(path, lang);
+    ret.sort_unstable_by_key(|r| &r.id);
+    ret
   }
 
   pub fn get_rule(&self, id: &str) -> Option<&RuleConfig<L>> {
@@ -131,6 +138,23 @@ impl<L: Language + Eq> RuleCollection<L> {
       }
     }
     None
+  }
+
+  pub fn total_rule_count(&self) -> usize {
+    let mut ret = self.tenured.iter().map(|bucket| bucket.rules.len()).sum();
+    ret += self.contingent.len();
+    ret
+  }
+
+  pub fn for_each_rule(&self, mut f: impl FnMut(&RuleConfig<L>)) {
+    for bucket in &self.tenured {
+      for rule in &bucket.rules {
+        f(rule);
+      }
+    }
+    for rule in &self.contingent {
+      f(&rule.rule);
+    }
   }
 
   fn add_tenured_rule(tenured: &mut Vec<RuleBucket<L>>, rule: RuleConfig<L>) {
@@ -173,7 +197,7 @@ message: test rule
 severity: info
 language: Tsx
 rule:
-  all: []
+  all: [kind: number]
 {files}"
       ),
       &globals,

@@ -1,6 +1,5 @@
 mod completions;
 mod config;
-mod error;
 mod lang;
 mod lsp;
 mod new;
@@ -12,12 +11,15 @@ mod verify;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 use completions::{run_shell_completion, CompletionsArg};
-use error::exit_with_error;
+use config::ProjectConfig;
+use lsp::{run_language_server, LspArg};
 use new::{run_create_new, NewArg};
-use run::{register_custom_language_if_is_run, run_with_pattern, RunArg};
+use run::{run_with_pattern, RunArg};
 use scan::{run_with_config, ScanArg};
+use utils::exit_with_error;
 use verify::{run_test_rule, TestArg};
 
 const LOGO: &str = r#"
@@ -39,6 +41,9 @@ Search and Rewrite code at large scale using AST pattern.
 struct App {
   #[clap(subcommand)]
   command: Commands,
+  /// Path to ast-grep root config, default is sgconfig.yml.
+  #[clap(short, long, global = true, value_name = "CONFIG_FILE")]
+  config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -52,7 +57,7 @@ enum Commands {
   /// Create new ast-grep project or items like rules/tests.
   New(NewArg),
   /// Start language server.
-  Lsp,
+  Lsp(LspArg),
   /// Generate shell completion script.
   Completions(CompletionsArg),
   /// Generate rule docs for current configuration. (Not Implemented Yet)
@@ -66,10 +71,23 @@ pub fn execute_main() -> Result<()> {
   }
 }
 
+fn is_command(arg: &str, command: &str) -> bool {
+  let arg = arg.split('=').next().unwrap_or(arg);
+  if arg.starts_with("--") {
+    let arg = arg.trim_start_matches("--");
+    arg == command
+  } else if arg.starts_with('-') {
+    let arg = arg.trim_start_matches('-');
+    arg == &command[..1]
+  } else {
+    false
+  }
+}
+
 fn try_default_run(args: &[String]) -> Result<Option<RunArg>> {
   // use `run` if there is at lease one pattern arg with no user provided command
   let should_use_default_run_command =
-    args.iter().skip(1).any(|p| p == "-p" || p == "--pattern") && args[1].starts_with('-');
+    args.iter().skip(1).any(|p| is_command(p, "pattern")) && args[1].starts_with('-');
   if should_use_default_run_command {
     // handle no subcommand
     let arg = RunArg::try_parse_from(args)?;
@@ -79,22 +97,46 @@ fn try_default_run(args: &[String]) -> Result<Option<RunArg>> {
   }
 }
 
+/// finding project and setup custom language configuration
+fn setup_project_is_possible(args: &[String]) -> Result<Result<ProjectConfig>> {
+  let mut config = None;
+  for i in 0..args.len() {
+    let arg = &args[i];
+    if !is_command(arg, "config") {
+      continue;
+    }
+    // handle --config=config.yml, see ast-grep/ast-grep#1617
+    if arg.contains('=') {
+      let config_file = arg.split('=').nth(1).unwrap().into();
+      config = Some(config_file);
+      break;
+    }
+    // handle -c config.yml, arg value should be next
+    if i + 1 >= args.len() || args[i + 1].starts_with('-') {
+      return Err(anyhow::anyhow!("missing config file after -c"));
+    }
+    let config_file = (&args[i + 1]).into();
+    config = Some(config_file);
+  }
+  ProjectConfig::setup(config)
+}
+
 // this wrapper function is for testing
 pub fn main_with_args(args: impl Iterator<Item = String>) -> Result<()> {
   let args: Vec<_> = args.collect();
-  register_custom_language_if_is_run(&args)?;
+  let project = setup_project_is_possible(&args)?;
+  // register_custom_language_if_is_run(&args)?;
   if let Some(arg) = try_default_run(&args)? {
-    return run_with_pattern(arg);
+    return run_with_pattern(arg, project);
   }
 
   let app = App::try_parse_from(args)?;
-  // TODO: add test for app parse
   match app.command {
-    Commands::Run(arg) => run_with_pattern(arg),
-    Commands::Scan(arg) => run_with_config(arg),
-    Commands::Test(arg) => run_test_rule(arg),
-    Commands::New(arg) => run_create_new(arg),
-    Commands::Lsp => lsp::run_language_server(),
+    Commands::Run(arg) => run_with_pattern(arg, project),
+    Commands::Scan(arg) => run_with_config(arg, project),
+    Commands::Test(arg) => run_test_rule(arg, project),
+    Commands::New(arg) => run_create_new(arg, project),
+    Commands::Lsp(arg) => run_language_server(arg, project),
     Commands::Completions(arg) => run_shell_completion::<App>(arg),
     Commands::Docs => todo!("todo, generate rule docs based on current config"),
   }
@@ -150,7 +192,7 @@ mod test_cli {
   fn test_no_arg_run() {
     let ret = main_with_args(["sg".to_owned()].into_iter());
     let err = ret.unwrap_err();
-    assert!(err.to_string().contains("sg <COMMAND>"));
+    assert!(err.to_string().contains("sg [OPTIONS] <COMMAND>"));
   }
   #[test]
   fn test_default_subcommand() {
@@ -165,6 +207,9 @@ mod test_cli {
     ok("run -p test --interactive dir");
     ok("run -p test -r Test dir");
     ok("run -p test -l rs --debug-query");
+    ok("run -p test -l rs --debug-query not");
+    ok("run -p test -l rs --debug-query=ast");
+    ok("run -p test -l rs --debug-query=cst");
     ok("run -p test -l rs --color always");
     ok("run -p test -l rs --heading always");
     ok("run -p test dir1 dir2 dir3"); // multiple paths
@@ -173,13 +218,27 @@ mod test_cli {
     ok("run -p test --json compact"); // argument after --json should not be parsed as JsonStyle
     ok("run -p test --json=pretty dir");
     ok("run -p test --json dir"); // arg after --json should not be parsed as JsonStyle
+    ok("run -p test --strictness ast");
+    ok("run -p test --strictness relaxed");
+    ok("run -p test --selector identifier"); // pattern + selector
+    ok("run -p test --selector identifier -l js");
+    ok("run -p test --follow");
+    ok("run -p test --globs '*.js'");
+    ok("run -p test --globs '*.{js, ts}'");
+    ok("run -p test --globs '*.js' --globs '*.ts'");
+    ok("run -p fubuki -j8");
+    ok("run -p test --threads 12");
+    ok("run -p test -l rs -c config.yml"); // global config arg
     error("run test");
     error("run --debug-query test"); // missing lang
     error("run -r Test dir");
     error("run -p test -i --json dir"); // conflict
-    error("run -p test -l rs -c always"); // no color shortcut
     error("run -p test -U");
     error("run -p test --update-all");
+    error("run -p test --strictness not");
+    error("run -p test -l rs --debug-query=not");
+    error("run -p test --selector");
+    error("run -p test --threads");
   }
 
   #[test]
@@ -194,7 +253,16 @@ mod test_cli {
     ok("scan -r test.yml --format github");
     ok("scan --format github");
     ok("scan --interactive");
+    ok("scan --follow");
     ok("scan -r test.yml -c test.yml --json dir"); // allow registering custom lang
+    ok("scan --globs '*.js'");
+    ok("scan --globs '*.{js, ts}'");
+    ok("scan --globs '*.js' --globs '*.ts'");
+    ok("scan -j 12");
+    ok("scan --threads 12");
+    ok("scan -A 12");
+    ok("scan --after 12");
+    ok("scan --context 1");
     error("scan -i --json dir"); // conflict
     error("scan --report-style rich --json dir"); // conflict
     error("scan -r test.yml --inline-rules '{}'"); // conflict
@@ -203,6 +271,8 @@ mod test_cli {
     error("scan --format local");
     error("scan --json=dir"); // wrong json flag
     error("scan --json= not-pretty"); // wrong json flag
+    error("scan -j");
+    error("scan --threads");
   }
 
   #[test]
@@ -213,6 +283,17 @@ mod test_cli {
     ok("test -U");
     ok("test --update-all");
     error("test --update-all --skip-snapshot-tests");
+  }
+  #[test]
+  fn test_new() {
+    ok("new");
+    ok("new project");
+    ok("new -c sgconfig.yml rule");
+    ok("new rule -y");
+    ok("new test -y");
+    ok("new util -y");
+    ok("new rule -c sgconfig.yml");
+    error("new --base-dir");
   }
 
   #[test]

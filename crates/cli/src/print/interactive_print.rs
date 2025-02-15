@@ -1,14 +1,12 @@
 use super::{Diff, Printer};
-use crate::error::ErrorContext as EC;
 use crate::lang::SgLang;
 use crate::utils;
+use crate::utils::ErrorContext as EC;
 
 use anyhow::{Context, Result};
 use ast_grep_config::RuleConfig;
 use ast_grep_core::{NodeMatch as SgNodeMatch, StrDoc};
 use codespan_reporting::files::SimpleFile;
-
-use std::sync::atomic::{AtomicBool, Ordering};
 
 type NodeMatch<'a, L> = SgNodeMatch<'a, StrDoc<L>>;
 
@@ -24,8 +22,9 @@ macro_rules! Diffs {
 }
 
 pub struct InteractivePrinter<P: Printer> {
-  accept_all: AtomicBool,
+  accept_all: bool,
   from_stdin: bool,
+  committed_cnt: usize,
   inner: P,
 }
 
@@ -35,19 +34,26 @@ impl<P: Printer> InteractivePrinter<P> {
       Err(anyhow::anyhow!(EC::StdInIsNotInteractive))
     } else {
       Ok(Self {
-        accept_all: AtomicBool::new(accept_all),
+        accept_all,
         from_stdin,
         inner,
+        committed_cnt: 0,
       })
     }
   }
 
   fn prompt_edit(&self) -> char {
+    if self.accept_all {
+      return 'a';
+    }
     const EDIT_PROMPT: &str = "Accept change? (Yes[y], No[n], Accept All[a], Quit[q], Edit[e])";
     utils::prompt(EDIT_PROMPT, "ynaqe", Some('n')).expect("Error happened during prompt")
   }
 
   fn prompt_view(&self) -> char {
+    if self.accept_all {
+      return '\n';
+    }
     const VIEW_PROMPT: &str = "Next[enter], Quit[q], Edit[e]";
     utils::prompt(VIEW_PROMPT, "qe", Some('\n')).expect("cannot fail")
   }
@@ -68,7 +74,7 @@ impl<P: Printer> InteractivePrinter<P> {
 
 impl<P: Printer> Printer for InteractivePrinter<P> {
   fn print_rule<'a>(
-    &self,
+    &mut self,
     matches: Matches!('a),
     file: SimpleFile<Cow<str>, &String>,
     rule: &RuleConfig<SgLang>,
@@ -76,7 +82,7 @@ impl<P: Printer> Printer for InteractivePrinter<P> {
     utils::run_in_alternate_screen(|| {
       let matches: Vec<_> = matches.collect();
       let first_match = match matches.first() {
-        Some(n) => n.start_pos().0,
+        Some(n) => n.start_pos().line(),
         None => return Ok(()),
       };
       let file_path = PathBuf::from(file.name().to_string());
@@ -93,22 +99,23 @@ impl<P: Printer> Printer for InteractivePrinter<P> {
     })
   }
 
-  fn print_matches<'a>(&self, matches: Matches!('a), path: &Path) -> Result<()> {
+  fn print_matches<'a>(&mut self, matches: Matches!('a), path: &Path) -> Result<()> {
     utils::run_in_alternate_screen(|| print_matches_and_confirm_next(self, matches, path))
   }
 
-  fn print_diffs<'a>(&self, diffs: Diffs!('a), path: &Path) -> Result<()> {
+  fn print_diffs<'a>(&mut self, diffs: Diffs!('a), path: &Path) -> Result<()> {
     let path = path.to_path_buf();
     let (confirmed, all) =
       print_diffs_interactive(self, &path, diffs.map(|d| (d, None)).collect())?;
     self.rewrite_action(confirmed, &path)?;
     if all {
-      self.accept_all.store(true, Ordering::SeqCst);
+      self.accept_all = true;
+      // self.accept_all.store(true, Ordering::SeqCst);
     }
     Ok(())
   }
   fn print_rule_diffs(
-    &self,
+    &mut self,
     diffs: Vec<(Diff<'_>, &RuleConfig<SgLang>)>,
     path: &Path,
   ) -> Result<()> {
@@ -120,19 +127,27 @@ impl<P: Printer> Printer for InteractivePrinter<P> {
     )?;
     self.rewrite_action(confirmed, &path)?;
     if all {
-      self.accept_all.store(true, Ordering::SeqCst);
+      self.accept_all = true;
+      // self.accept_all.store(true, Ordering::SeqCst);
     }
     Ok(())
+  }
+
+  fn after_print(&mut self) -> Result<()> {
+    if self.committed_cnt > 0 {
+      println!("Applied {} changes", self.committed_cnt);
+    }
+    self.inner.after_print()
   }
 }
 
 fn print_diffs_interactive<'a>(
-  interactive: &InteractivePrinter<impl Printer>,
+  interactive: &mut InteractivePrinter<impl Printer>,
   path: &Path,
   diffs: Vec<(Diff<'a>, Option<&RuleConfig<SgLang>>)>,
 ) -> Result<(Vec<Diff<'a>>, bool)> {
   let mut confirmed = vec![];
-  let mut all = interactive.accept_all.load(Ordering::SeqCst);
+  let mut all = interactive.accept_all;
   let mut end = 0;
   for (diff, rule) in diffs {
     if diff.range.start < end {
@@ -147,18 +162,19 @@ fn print_diffs_interactive<'a>(
     if confirm {
       end = diff.range.end;
       confirmed.push(diff);
+      interactive.committed_cnt = interactive.committed_cnt.saturating_add(1);
     }
   }
   Ok((confirmed, all))
 }
 /// returns if accept_current and accept_all
 fn print_diff_and_prompt_action(
-  interactive: &InteractivePrinter<impl Printer>,
+  interactive: &mut InteractivePrinter<impl Printer>,
   path: &Path,
   (diff, rule): (Diff, Option<&RuleConfig<SgLang>>),
 ) -> Result<(bool, bool)> {
-  let printer = &interactive.inner;
   utils::run_in_alternate_screen(|| {
+    let printer = &mut interactive.inner;
     if let Some(rule) = rule {
       printer.print_rule_diffs(vec![(diff.clone(), rule)], path)?;
     } else {
@@ -168,7 +184,7 @@ fn print_diff_and_prompt_action(
       'y' => Ok((true, false)),
       'a' => Ok((true, true)),
       'e' => {
-        let pos = diff.node_match.start_pos().0;
+        let pos = diff.node_match.start_pos().line();
         open_in_editor(path, pos)?;
         Ok((false, false))
       }
@@ -180,14 +196,14 @@ fn print_diff_and_prompt_action(
 }
 
 fn print_matches_and_confirm_next<'a>(
-  interactive: &InteractivePrinter<impl Printer>,
+  interactive: &mut InteractivePrinter<impl Printer>,
   matches: Matches!('a),
   path: &Path,
 ) -> Result<()> {
-  let printer = &interactive.inner;
+  let printer = &mut interactive.inner;
   let matches: Vec<_> = matches.collect();
   let first_match = match matches.first() {
-    Some(n) => n.start_pos().0,
+    Some(n) => n.start_pos().line(),
     None => return Ok(()),
   };
   printer.print_matches(matches.into_iter(), path)?;

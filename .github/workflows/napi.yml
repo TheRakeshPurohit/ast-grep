@@ -24,10 +24,10 @@ jobs:
         settings:
           - host: macos-latest
             target: x86_64-apple-darwin
+            # no test
             build: |
-              yarn build
+              yarn build --target x86_64-apple-darwin
               strip -x *.node
-              yarn test
           - host: windows-latest
             build: |
               yarn build
@@ -50,22 +50,37 @@ jobs:
               yarn build --target x86_64-unknown-linux-gnu &&
               strip *.node &&
               yarn test
+          - host: ubuntu-20.04
+            target: x86_64-unknown-linux-musl
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine-zig
+            build: |-
+              set -e &&
+              cd crates/napi &&
+              yarn build --target x86_64-unknown-linux-musl &&
+              strip *.node &&
+              yarn test
+          - host: ubuntu-20.04
+            target: aarch64-unknown-linux-musl
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
+            build: |-
+              set -e &&
+              cd crates/napi &&
+              rustup target add aarch64-unknown-linux-musl &&
+              yarn build --target aarch64-unknown-linux-musl
           - host: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-aarch64
             build: |-
               set -e &&
               cd crates/napi &&
-              export CFLAGS="-std=c99" &&
-              export CXXFLAGS="-std=c++11" &&
               yarn build --target aarch64-unknown-linux-gnu &&
               aarch64-unknown-linux-gnu-strip *.node
           - host: macos-latest
             target: aarch64-apple-darwin
-            # no test
             build: |
               yarn build --target aarch64-apple-darwin
               strip -x *.node
+              yarn test
     name: stable - ${{ matrix.settings.target }} - node@18
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -132,7 +147,7 @@ jobs:
         if: ${{ !matrix.settings.docker }}
         shell: bash
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.settings.target }}
           path: crates/napi/${{ env.APP_NAME }}.*.node
@@ -161,9 +176,12 @@ jobs:
       - name: Install dependencies
         run: yarn install
       - name: Download all artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: crates/napi/artifacts
+      - name: Generate Types
+        run: |-
+          yarn typegen
       - name: Move artifacts
         run: yarn artifacts
       - name: List packages

@@ -1,8 +1,3 @@
-use crate::source::Content;
-use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::ops::Range;
-
 /**
   This module is for indentation-sensitive replacement.
 
@@ -51,70 +46,74 @@ use std::ops::Range;
 
   ## Extract Meta-var with de-indent
   1. Initial meta-var node B text:
-  The meta-var source indentation for `$B` is 4.
-  However, meta-var node does not have the first line indentation.
-  ```ignore
-  1
+      The meta-var source indentation for `$B` is 4.
+      However, meta-var node does not have the first line indentation.
+      ```ignore
+      1
+            + 2
+            + 3
+      ```
+  2. Deindent meta-var node B, except first line:
+      De-indenting all lines following the first line by 4 spaces gives us this relative code layout.
+
+      ```ignore
+      1
         + 2
         + 3
-  ```
-  2. Deindent meta-var node B, except first line:
-  De-indenting all lines following the first line by 4 spaces gives us this relative code layout.
-
-  ```ignore
-  1
-    + 2
-    + 3
-  ```
+      ```
 
   ## Insert meta-var into replacement with re-indent
 
   3. Re-indent by meta-var replacement indentation.
-  meta-var node $B occurs in replace with first line indentation of 2.
-  We need to re-indent the meta-var code before replacement, except the first line
-  ```ignore
-  1
-      + 2
-      + 3
-  ```
+      meta-var node $B occurs in replace with first line indentation of 2.
+      We need to re-indent the meta-var code before replacement, except the first line
+      ```ignore
+      1
+          + 2
+          + 3
+      ```
 
   4. Insert meta-var code in to replacement
-  ```ignore
-  c(
-    1
-      + 2
-      + 3
-  )
-  ```
+      ```ignore
+      c(
+        1
+          + 2
+          + 3
+      )
+      ```
 
   ## Insert replacement into source with re-indent
 
   5. Re-indent the replaced template code except first line
-  The whole matched node first line indentation is 2.
-  We need to reindent the replacement code by 2, except the first line.
-  ```ignore
-  c(
-      1
-        + 2
-        + 3
-    )
-  ```
+      The whole matched node first line indentation is 2.
+      We need to reindent the replacement code by 2, except the first line.
+      ```ignore
+      c(
+          1
+            + 2
+            + 3
+        )
+      ```
 
   6. Inserted replacement code to original tree
 
-  ```ignore
-  if (true) {
-    c(
-      1
-        + 2
-        + 3
-    )
-  }
-  ```
+      ```ignore
+      if (true) {
+        c(
+          1
+            + 2
+            + 3
+        )
+      }
+      ```
 
   The steps 3,4 and steps 5,6 are similar. We can define a `replace_with_indent` to it.
-  Following the same path, we can define a `extract_with_deindent` for steps 1,2.
+  Following the same path, we can define a `extract_with_deindent` for steps 1,2
 */
+use crate::source::Content;
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::ops::Range;
 
 /// We assume NEW_LINE, TAB, SPACE is only one code unit.
 /// This is sufficiently true for utf8, utf16 and char.
@@ -144,6 +143,27 @@ pub fn extract_with_deindent<C: Content>(content: &C, range: Range<usize>) -> De
   }
   let indent = get_indent_at_offset::<C>(content.get_range(0..range.start));
   DeindentedExtract::MultiLine(extract_slice, indent)
+}
+
+fn deindent_slice<'a, C: Content>(
+  slice: &'a [C::Underlying],
+  content: &'a C,
+  start: usize,
+) -> DeindentedExtract<'a, C> {
+  if !slice.contains(&get_new_line::<C>()) {
+    return DeindentedExtract::SingleLine(slice);
+  }
+  let indent = get_indent_at_offset::<C>(content.get_range(0..start));
+  DeindentedExtract::MultiLine(slice, indent)
+}
+
+pub fn formatted_slice<'a, C: Content>(
+  slice: &'a [C::Underlying],
+  content: &'a C,
+  start: usize,
+) -> Cow<'a, [C::Underlying]> {
+  let deindent = deindent_slice(slice, content, start);
+  indent_lines(0, deindent)
 }
 
 pub fn indent_lines<C: Content>(

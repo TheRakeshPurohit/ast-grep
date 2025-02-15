@@ -5,6 +5,8 @@ use crate::{Doc, Language, Node, StrDoc};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use crate::replacer::formatted_slice;
+
 pub type MetaVariableID = String;
 
 type Underlying<D> = Vec<<<D as Doc>::Source as Content>::Underlying>;
@@ -44,8 +46,18 @@ impl<'tree, D: Doc> MetaVarEnv<'tree, D> {
     }
   }
 
-  pub fn insert_transformation(&mut self, name: &str, src: Underlying<D>) {
-    self.transformed_var.insert(name.to_string(), src);
+  pub fn insert_transformation(&mut self, var: &MetaVariable, name: &str, slice: Underlying<D>) {
+    let node = match var {
+      MetaVariable::Capture(v, _) => self.single_matched.get(v),
+      MetaVariable::MultiCapture(vs) => self.multi_matched.get(vs).and_then(|vs| vs.first()),
+      _ => None,
+    };
+    let deindented = if let Some(v) = node {
+      formatted_slice(&slice, v.root.doc.get_source(), v.range().start).to_vec()
+    } else {
+      slice
+    };
+    self.transformed_var.insert(name.to_string(), deindented);
   }
 
   pub fn get_match(&self, var: &str) -> Option<&'_ Node<'tree, D>> {
@@ -145,6 +157,22 @@ impl<'tree, D: Doc> MetaVarEnv<'tree, D> {
       }
     }
   }
+
+  /// internal for readopt NodeMatch in pinned.rs
+  /// readopt node and env when sending them to other threads
+  pub(crate) fn visit_nodes<F>(&mut self, mut f: F)
+  where
+    F: FnMut(&mut Node<'_, D>),
+  {
+    for n in self.single_matched.values_mut() {
+      f(n)
+    }
+    for ns in self.multi_matched.values_mut() {
+      for n in ns {
+        f(n)
+      }
+    }
+  }
 }
 
 fn get_var_bytes_impl<'t, C, D>(
@@ -183,7 +211,7 @@ where
   }
 }
 
-impl<'tree, D: Doc> Default for MetaVarEnv<'tree, D> {
+impl<D: Doc> Default for MetaVarEnv<'_, D> {
   fn default() -> Self {
     Self::new()
   }
@@ -196,7 +224,7 @@ pub enum MetaVariable {
   /// $_ for non-captured meta var
   Dropped(bool),
   /// $$$ for non-captured multi var
-  Mutliple,
+  Multiple,
   /// $$$A for captured ellipsis
   MultiCapture(MetaVariableID),
 }
@@ -205,14 +233,14 @@ pub(crate) fn extract_meta_var(src: &str, meta_char: char) -> Option<MetaVariabl
   use MetaVariable::*;
   let ellipsis: String = std::iter::repeat(meta_char).take(3).collect();
   if src == ellipsis {
-    return Some(Mutliple);
+    return Some(Multiple);
   }
   if let Some(trimmed) = src.strip_prefix(&ellipsis) {
     if !trimmed.chars().all(is_valid_meta_var_char) {
       return None;
     }
     if trimmed.starts_with('_') {
-      return Some(Mutliple);
+      return Some(Multiple);
     } else {
       return Some(MultiCapture(trimmed.to_owned()));
     }
@@ -282,7 +310,7 @@ mod test {
   #[test]
   fn test_match_var() {
     use MetaVariable::*;
-    assert_eq!(extract_var("$$$"), Some(Mutliple));
+    assert_eq!(extract_var("$$$"), Some(Multiple));
     assert_eq!(extract_var("$ABC"), Some(Capture("ABC".into(), true)));
     assert_eq!(extract_var("$$ABC"), Some(Capture("ABC".into(), false)));
     assert_eq!(extract_var("$MATCH1"), Some(Capture("MATCH1".into(), true)));
@@ -315,7 +343,7 @@ mod test {
   fn test_non_ascii_meta_var() {
     let extract = |s| extract_meta_var(s, 'µ');
     use MetaVariable::*;
-    assert_eq!(extract("µµµ"), Some(Mutliple));
+    assert_eq!(extract("µµµ"), Some(Multiple));
     assert_eq!(extract("µABC"), Some(Capture("ABC".into(), true)));
     assert_eq!(extract("µµABC"), Some(Capture("ABC".into(), false)));
     assert_eq!(extract("µµµABC"), Some(MultiCapture("ABC".into())));

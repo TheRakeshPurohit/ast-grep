@@ -4,6 +4,8 @@ use crate::source::Edit as E;
 use crate::{Doc, Node, Root};
 use std::ops::Range;
 
+pub(crate) use indent::formatted_slice;
+
 type Edit<D> = E<<D as Doc>::Source>;
 type Underlying<S> = Vec<<S as Content>::Underlying>;
 
@@ -49,7 +51,7 @@ where
   }
 }
 
-impl<'a, D: Doc> Replacer<D> for Node<'a, D> {
+impl<D: Doc> Replacer<D> for Node<'_, D> {
   fn generate_replacement(&self, _nm: &NodeMatch<D>) -> Underlying<D::Source> {
     let range = self.range();
     self.root.doc.get_source().get_range(range).to_vec()
@@ -62,6 +64,16 @@ enum MetaVarExtract {
   /// $$$A for captured ellipsis
   Multiple(MetaVariableID),
   Transformed(MetaVariableID),
+}
+
+impl MetaVarExtract {
+  fn used_var(&self) -> &str {
+    match self {
+      MetaVarExtract::Single(s) => s,
+      MetaVarExtract::Multiple(s) => s,
+      MetaVarExtract::Transformed(s) => s,
+    }
+  }
 }
 
 fn split_first_meta_var(

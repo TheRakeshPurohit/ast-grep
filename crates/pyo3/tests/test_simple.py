@@ -1,4 +1,4 @@
-from ast_grep_py import SgRoot
+from ast_grep_py import SgRoot, Rule
 
 source = """
 function test() {
@@ -49,19 +49,26 @@ def test_matches():
     assert not node.matches(kind="number")
     assert node.matches(pattern="let a = 123")
     assert not node.matches(pattern="let b = 456")
+    assert node.matches(has=Rule(
+        kind="variable_declarator",
+        has=Rule(
+            kind="number",
+            pattern="123"
+        )
+    ))
 
 def test_inside():
     node = root.find(pattern="let $A = $B")
     assert node
     assert node.inside(kind="function_declaration")
-    assert not node.inside(kind="function")
+    assert not node.inside(kind="function_expression")
 
 def test_has():
     node = root.find(pattern="let $A = $B")
     assert node
     assert node.has(pattern="123")
     assert node.has(kind="number")
-    assert not node.has(kind="function")
+    assert not node.has(kind="function_expression")
 
 def test_precedes():
     node = root.find(pattern="let $A = $B\n")

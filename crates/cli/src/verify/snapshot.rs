@@ -33,12 +33,10 @@ fn merge_snapshots(
 /// Snapshot update can be accepted or rejected.
 #[derive(Debug)]
 pub enum SnapshotAction {
-  /// Accept all changes
-  AcceptAll,
+  /// Accept changes
+  NeedUpdate,
   /// Reject all changes.
   AcceptNone,
-  /// Delete outdated snapshots.
-  Selectively(SnapshotCollection),
 }
 
 impl SnapshotAction {
@@ -48,11 +46,10 @@ impl SnapshotAction {
     results: &[CaseResult],
   ) -> Option<SnapshotCollection> {
     let accepted = match self {
-      Self::AcceptAll => results
+      Self::NeedUpdate => results
         .iter()
         .map(|result| (result.id.to_string(), result.changed_snapshots()))
         .collect(),
-      Self::Selectively(a) => a,
       Self::AcceptNone => return None,
     };
     Some(merge_snapshots(accepted, existing))
@@ -234,7 +231,7 @@ mod tests {
   #[test]
   fn test_snapshot_action() -> Result<()> {
     use crate::verify::CaseStatus;
-    let action = SnapshotAction::AcceptAll;
+    let action = SnapshotAction::NeedUpdate;
     let rule_config = get_rule_config("pattern: let x = $A");
     let sc = SnapshotCollection::new();
     let op = action
@@ -242,10 +239,9 @@ mod tests {
         sc,
         &[CaseResult {
           id: TEST_RULE,
-          cases: vec![CaseStatus::Wrong {
+          cases: vec![CaseStatus::Updated {
             source: "let x = 123",
-            expected: None,
-            actual: TestSnapshot::generate(&rule_config, "let x = 123")?.unwrap(),
+            updated: TestSnapshot::generate(&rule_config, "let x = 123")?.unwrap(),
           }],
         }],
       )

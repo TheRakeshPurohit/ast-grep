@@ -224,17 +224,32 @@ switch (platform) {
         }
         break
       case 'arm':
-        localFileExisted = existsSync(
-          join(__dirname, 'ast-grep-napi.linux-arm-gnueabihf.node')
-        )
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./ast-grep-napi.linux-arm-gnueabihf.node')
-          } else {
-            nativeBinding = require('@ast-grep/napi-linux-arm-gnueabihf')
+        if (isMusl()) {
+          localFileExisted = existsSync(
+            join(__dirname, 'ast-grep-napi.linux-arm-musleabihf.node')
+          )
+          try {
+            if (localFileExisted) {
+              nativeBinding = require('./ast-grep-napi.linux-arm-musleabihf.node')
+            } else {
+              nativeBinding = require('@ast-grep/napi-linux-arm-musleabihf')
+            }
+          } catch (e) {
+            loadError = e
           }
-        } catch (e) {
-          loadError = e
+        } else {
+          localFileExisted = existsSync(
+            join(__dirname, 'ast-grep-napi.linux-arm-gnueabihf.node')
+          )
+          try {
+            if (localFileExisted) {
+              nativeBinding = require('./ast-grep-napi.linux-arm-gnueabihf.node')
+            } else {
+              nativeBinding = require('@ast-grep/napi-linux-arm-gnueabihf')
+            }
+          } catch (e) {
+            loadError = e
+          }
         }
         break
       case 'riscv64':
@@ -266,6 +281,20 @@ switch (platform) {
           }
         }
         break
+      case 's390x':
+        localFileExisted = existsSync(
+          join(__dirname, 'ast-grep-napi.linux-s390x-gnu.node')
+        )
+        try {
+          if (localFileExisted) {
+            nativeBinding = require('./ast-grep-napi.linux-s390x-gnu.node')
+          } else {
+            nativeBinding = require('@ast-grep/napi-linux-s390x-gnu')
+          }
+        } catch (e) {
+          loadError = e
+        }
+        break
       default:
         throw new Error(`Unsupported architecture on Linux: ${arch}`)
     }
@@ -281,12 +310,18 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { FrontEndLanguage, SgNode, SgRoot, parseFiles, html, js, jsx, ts, tsx, css } = nativeBinding
+const { parseFiles, Lang, SgNode, SgRoot, parse, parseAsync, kind, pattern, findInFiles, registerDynamicLanguage, html, js, jsx, ts, tsx, css } = nativeBinding
 
-module.exports.FrontEndLanguage = FrontEndLanguage
+module.exports.parseFiles = parseFiles
+module.exports.Lang = Lang
 module.exports.SgNode = SgNode
 module.exports.SgRoot = SgRoot
-module.exports.parseFiles = parseFiles
+module.exports.parse = parse
+module.exports.parseAsync = parseAsync
+module.exports.kind = kind
+module.exports.pattern = pattern
+module.exports.findInFiles = findInFiles
+module.exports.registerDynamicLanguage = registerDynamicLanguage
 module.exports.html = html
 module.exports.js = js
 module.exports.jsx = jsx

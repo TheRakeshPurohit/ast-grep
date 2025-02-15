@@ -8,6 +8,7 @@ use ast_grep_core::{Doc, Matcher, Node};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 #[derive(Serialize, Deserialize, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -19,18 +20,46 @@ pub struct Relation {
   pub field: Option<String>,
 }
 
+fn field_name_to_id<L: Language>(
+  field: Option<String>,
+  env: &DeserializeEnv<L>,
+) -> Result<Option<u16>, RuleSerializeError> {
+  let Some(field) = field else {
+    return Ok(None);
+  };
+  let ts_lang = env.lang.get_ts_language();
+  match ts_lang.field_id_for_name(&field) {
+    Some(id) => Ok(Some(id)),
+    None => Err(RuleSerializeError::InvalidField(field)),
+  }
+}
+
 pub struct Inside<L: Language> {
   outer: Rule<L>,
-  field: Option<String>,
+  field: Option<u16>,
   stop_by: StopBy<L>,
 }
 impl<L: Language> Inside<L> {
   pub fn try_new(relation: Relation, env: &DeserializeEnv<L>) -> Result<Self, RuleSerializeError> {
     Ok(Self {
       stop_by: StopBy::try_from(relation.stop_by, env)?,
-      field: relation.field,
+      field: field_name_to_id(relation.field, env)?,
       outer: env.deserialize_rule(relation.rule)?, // TODO
     })
+  }
+
+  pub fn defined_vars(&self) -> HashSet<&str> {
+    self
+      .outer
+      .defined_vars()
+      .union(&self.stop_by.defined_vars())
+      .copied()
+      .collect()
+  }
+
+  pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
+    self.outer.verify_util()?;
+    self.stop_by.verify_util()
   }
 }
 
@@ -42,12 +71,12 @@ impl<L: Language> Matcher<L> for Inside<L> {
   ) -> Option<Node<'tree, D>> {
     let parent = || node.parent();
     let ancestors = || node.ancestors();
-    if let Some(field) = &self.field {
+    if let Some(field) = self.field {
       let mut last_id = node.node_id();
       let finder = move |nd: Node<'tree, D>| {
         let expect_id = last_id;
         last_id = nd.node_id();
-        let n = nd.field(field)?;
+        let n = nd.child_by_field_id(field)?;
         if n.node_id() != expect_id {
           None
         } else {
@@ -65,15 +94,29 @@ impl<L: Language> Matcher<L> for Inside<L> {
 pub struct Has<L: Language> {
   inner: Rule<L>,
   stop_by: StopBy<L>,
-  field: Option<String>,
+  field: Option<u16>,
 }
 impl<L: Language> Has<L> {
   pub fn try_new(relation: Relation, env: &DeserializeEnv<L>) -> Result<Self, RuleSerializeError> {
     Ok(Self {
       stop_by: StopBy::try_from(relation.stop_by, env)?,
       inner: env.deserialize_rule(relation.rule)?,
-      field: relation.field,
+      field: field_name_to_id(relation.field, env)?,
     })
+  }
+
+  pub fn defined_vars(&self) -> HashSet<&str> {
+    self
+      .inner
+      .defined_vars()
+      .union(&self.stop_by.defined_vars())
+      .copied()
+      .collect()
+  }
+
+  pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
+    self.inner.verify_util()?;
+    self.stop_by.verify_util()
   }
 }
 
@@ -83,8 +126,8 @@ impl<L: Language> Matcher<L> for Has<L> {
     node: Node<'tree, D>,
     env: &mut Cow<MetaVarEnv<'tree, D>>,
   ) -> Option<Node<'tree, D>> {
-    if let Some(field) = &self.field {
-      let nd = node.field(field)?;
+    if let Some(field) = self.field {
+      let nd = node.child_by_field_id(field)?;
       return match &self.stop_by {
         StopBy::Neighbor => self.inner.match_node_with_env(nd, env),
         StopBy::End => nd
@@ -141,6 +184,20 @@ impl<L: Language> Precedes<L> {
       later: env.deserialize_rule(relation.rule)?,
     })
   }
+
+  pub fn defined_vars(&self) -> HashSet<&str> {
+    self
+      .later
+      .defined_vars()
+      .union(&self.stop_by.defined_vars())
+      .copied()
+      .collect()
+  }
+
+  pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
+    self.later.verify_util()?;
+    self.stop_by.verify_util()
+  }
 }
 impl<L: Language> Matcher<L> for Precedes<L> {
   fn match_node_with_env<'tree, D: Doc<Lang = L>>(
@@ -168,6 +225,19 @@ impl<L: Language> Follows<L> {
       stop_by: StopBy::try_from(relation.stop_by, env)?,
       former: env.deserialize_rule(relation.rule)?,
     })
+  }
+  pub fn defined_vars(&self) -> HashSet<&str> {
+    self
+      .former
+      .defined_vars()
+      .union(&self.stop_by.defined_vars())
+      .copied()
+      .collect()
+  }
+
+  pub fn verify_util(&self) -> Result<(), RuleSerializeError> {
+    self.former.verify_util()?;
+    self.stop_by.verify_util()
   }
 }
 impl<L: Language> Matcher<L> for Follows<L> {
@@ -551,7 +621,7 @@ mod test {
     let inside = Inside {
       stop_by: StopBy::End,
       outer: Rule::Kind(KindMatcher::new("for_statement", TS::Tsx)),
-      field: Some("condition".into()),
+      field: TS::Tsx.get_ts_language().field_id_for_name("condition"),
     };
     let rule = make_rule("a = 1", Rule::Inside(Box::new(inside)));
     test_found(&["for (;a = 1;) {}"], &rule);
@@ -563,7 +633,7 @@ mod test {
     let has = Has {
       stop_by: StopBy::End,
       inner: Rule::Pattern(Pattern::new("a = 1", TS::Tsx)),
-      field: Some("condition".into()),
+      field: TS::Tsx.get_ts_language().field_id_for_name("condition"),
     };
     let rule = o::All::new(vec![
       Rule::Kind(KindMatcher::new("for_statement", TS::Tsx)),
@@ -571,5 +641,47 @@ mod test {
     ]);
     test_found(&["for (;a = 1;) {}"], &rule);
     test_not_found(&["for (;; a = 1) {}", "for (;;) { a = 1}"], &rule);
+  }
+
+  #[test]
+  fn test_invalid_field() {
+    let env = DeserializeEnv::new(TS::Tsx);
+    let relation = Relation {
+      rule: crate::from_str("pattern: test").unwrap(),
+      stop_by: SerializableStopBy::End,
+      field: Some("invalid_field".to_string()),
+    };
+    let inside = Inside::try_new(relation, &env);
+    assert!(inside.is_err());
+    match inside {
+      Err(RuleSerializeError::InvalidField(_)) => {}
+      _ => panic!("expected InvalidField error"),
+    }
+  }
+
+  #[test]
+  fn test_defined_vars() {
+    let precedes = Precedes {
+      later: Rule::Pattern(Pattern::new("var a = $A", TS::Tsx)),
+      stop_by: StopBy::Rule(Rule::Pattern(Pattern::new("var b = $B", TS::Tsx))),
+    };
+    assert_eq!(precedes.defined_vars(), ["A", "B"].into_iter().collect());
+    let follows = Follows {
+      former: Rule::Pattern(Pattern::new("var a = 123", TS::Tsx)),
+      stop_by: StopBy::Rule(Rule::Pattern(Pattern::new("var b = $B", TS::Tsx))),
+    };
+    assert_eq!(follows.defined_vars(), ["B"].into_iter().collect());
+    let inside = Inside {
+      stop_by: StopBy::Rule(Rule::Pattern(Pattern::new("var $C", TS::Tsx))),
+      outer: Rule::Pattern(Pattern::new("var a = $A", TS::Tsx)),
+      field: TS::Tsx.get_ts_language().field_id_for_name("condition"),
+    };
+    assert_eq!(inside.defined_vars(), ["A", "C"].into_iter().collect());
+    let has = Has {
+      stop_by: StopBy::Rule(Rule::Kind(KindMatcher::new("for_statement", TS::Tsx))),
+      inner: Rule::Pattern(Pattern::new("var a = $A", TS::Tsx)),
+      field: TS::Tsx.get_ts_language().field_id_for_name("condition"),
+    };
+    assert_eq!(has.defined_vars(), ["A"].into_iter().collect());
   }
 }

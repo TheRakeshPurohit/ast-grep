@@ -14,7 +14,7 @@ fn read_rule() -> RuleConfig<SupportLang> {
 }
 
 fn find_pattern<M: Matcher<SupportLang>>(sg: &AstGrep<StrDoc<SupportLang>>, pattern: &M) {
-  sg.root().find_all(pattern).for_each(|n| drop(n));
+  sg.root().find_all(pattern).for_each(drop);
 }
 
 fn get_sg(path: &str) -> AstGrep<StrDoc<SupportLang>> {
@@ -50,5 +50,12 @@ fn rule_bench(c: &mut Criterion) {
   });
 }
 
-criterion_group!(benches, find_all_bench, rule_bench);
+fn build_pattern_bench(c: &mut Criterion) {
+  let lang = SupportLang::TypeScript;
+  c.bench_function("Build Normal Pattern", |b| {
+    b.iter(|| Pattern::str(black_box("function $FUNC($$$ARGS) { $$$BODY }"), lang))
+  });
+}
+
+criterion_group!(benches, find_all_bench, rule_bench, build_pattern_bench);
 criterion_main!(benches);
