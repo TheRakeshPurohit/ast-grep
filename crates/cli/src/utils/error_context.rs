@@ -8,6 +8,7 @@ const DOC_SITE_HOST: &str = "https://ast-grep.github.io";
 const PATTERN_GUIDE: Option<&str> = Some("/guide/pattern-syntax.html");
 const CONFIG_GUIDE: Option<&str> = Some("/guide/rule-config.html");
 const CONFIG_REFERENCE: Option<&str> = Some("/reference/sgconfig.html");
+const PROJECT_GUIDE: Option<&str> = Some("/guide/scan-project.html");
 const TOOL_OVERVIEW: Option<&str> = Some("/guide/tooling-overview.html#parse-code-from-stdin");
 const CLI_USAGE: Option<&str> = Some("/reference/cli.html");
 const TEST_GUIDE: Option<&str> = Some("/guide/test-rule.html");
@@ -15,6 +16,8 @@ const UTIL_GUIDE: Option<&str> = Some("/guide/rule-config/utility-rule.html");
 const EDITOR_INTEGRATION: Option<&str> = Some("/guide/editor-integration.html");
 const LANGUAGE_LIST: Option<&str> = Some("/reference/languages.html");
 const PLAYGROUND: Option<&str> = Some("/playground.html");
+const CUSTOM_LANG_GUIDE: Option<&str> = Some("/advanced/custom-language.html");
+const UTILITY_RULE: Option<&str> = Some("/guide/rule-config/utility-rule.html");
 
 /// AppError stands for ast-grep command line usage.
 /// It provides abstraction around exit code, context,
@@ -28,8 +31,12 @@ pub enum ErrorContext {
   ReadRule(PathBuf),
   ParseRule(PathBuf),
   ParseTest(PathBuf),
+  InvalidGlobalUtils,
   GlobPattern,
+  BuildGlobs,
   UnrecognizableLanguage(String),
+  LangInjection,
+  CustomLanguage,
   // Run
   ParsePattern,
   LanguageNotSpecified,
@@ -68,11 +75,14 @@ impl ErrorContext {
       NoTestDirConfigured | NoUtilDirConfigured => 4,
       ReadConfiguration | ReadRule(_) | WalkRuleDir(_) | WriteFile(_) => 5,
       StdInIsNotInteractive => 6,
-      ParseTest(_) | ParseRule(_) | ParseConfiguration | GlobPattern | ParsePattern => 8,
+      ParseTest(_) | ParseRule(_) | ParseConfiguration | ParsePattern | InvalidGlobalUtils
+      | LangInjection => 8,
+      GlobPattern | BuildGlobs => 9,
       CannotInferShell => 10,
       ProjectAlreadyExist | FileAlreadyExist(_) => 17,
       InsufficientCLIArgument(_) => 22,
       UnrecognizableLanguage(_) => 33,
+      CustomLanguage => 79,
       OpenEditor | StartLanguageServer => 126,
       // soft error
       PatternHasError => 0,
@@ -144,6 +154,26 @@ impl ErrorMessage {
         "The pattern in files/ignore is not a valid glob. Please refer to doc and fix the error.",
         CONFIG_GUIDE,
       ),
+      BuildGlobs => Self::new(
+        "Cannot build glob from CLI flag",
+        "The patterns in --globs is invalid. Please refer to doc and fix the error.",
+        CLI_USAGE,
+      ),
+      LangInjection => Self::new(
+        "Cannot parse languageInjections in config",
+        "The rule in languageInjections is not valid. Please refer to doc and fix the error.",
+        CONFIG_GUIDE,
+      ),
+      CustomLanguage => Self::new(
+        "Cannot load custom language library",
+        "The custom language library is not found or cannot be loaded.",
+        CUSTOM_LANG_GUIDE,
+      ),
+      InvalidGlobalUtils => Self::new(
+        "Error occurs when parsing global utility rules",
+        "Please check the YAML rules inside the rule directory",
+        UTILITY_RULE,
+      ),
       UnrecognizableLanguage(lang) => Self::new(
         format!("Language `{lang}` is not supported"),
         "Please choose a built-in language or register a custom language in sgconfig.yml.",
@@ -212,12 +242,12 @@ impl ErrorMessage {
       ProjectAlreadyExist => Self::new(
         "ast-grep project already exists.",
         "You are already inside a sub-folder of an ast-grep project. Try finding sgconfig.yml in ancestor directory?",
-        CONFIG_GUIDE,
+        PROJECT_GUIDE,
       ),
       ProjectNotExist => Self::new(
-        "Fail to create the item because no project configuration is found.",
-        "You need to create an ast-grep project before creating rule. Try `sg new` to create one.",
-        CONFIG_GUIDE,
+        "No ast-grep project configuration is found.",
+        "You need to create an ast-grep project for this command. Try `sg new` to create one.",
+        PROJECT_GUIDE,
       ),
       FileAlreadyExist(path) => Self::new(
         format!("File `{}` already exists.", path.display()),
@@ -280,7 +310,7 @@ struct ErrorFormat<'a> {
   inner: &'a Error,
 }
 
-impl<'a> fmt::Display for ErrorFormat<'a> {
+impl fmt::Display for ErrorFormat<'_> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     let ErrorMessage {
       title,

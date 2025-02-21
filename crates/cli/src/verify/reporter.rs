@@ -5,10 +5,9 @@ use ansi_term::{Color, Style};
 use anyhow::Result;
 use serde_yaml::to_string;
 
-use std::collections::HashMap;
 use std::io::Write;
 
-use super::{CaseResult, CaseStatus, SnapshotAction, SnapshotCollection, TestCase, TestSnapshots};
+use super::{CaseResult, CaseStatus, SnapshotAction, TestCase};
 
 pub(super) trait Reporter {
   type Output: Write;
@@ -37,15 +36,15 @@ pub(super) trait Reporter {
     }
   }
 
-  fn report_failed_cases(&mut self, results: &[CaseResult]) -> Result<()> {
+  fn report_failed_cases(&mut self, results: &mut [CaseResult]) -> Result<()> {
     let output = self.get_output();
     writeln!(output)?;
-    writeln!(output, "----------- Failure Details -----------")?;
+    writeln!(output, "----------- Case Details -----------")?;
     for result in results {
       if result.passed() {
         continue;
       }
-      for status in &result.cases {
+      for status in &mut result.cases {
         if !self.report_case_detail(result.id, status)? {
           return Ok(());
         }
@@ -54,10 +53,17 @@ pub(super) trait Reporter {
     Ok(())
   }
 
+  fn report_summaries(&mut self, results: &[CaseResult]) -> Result<()> {
+    for result in results {
+      self.report_case_summary(result.id, &result.cases)?;
+    }
+    let output = self.get_output();
+    writeln!(output)?;
+    Ok(())
+  }
+
   fn report_case_summary(&mut self, case_id: &str, summary: &[CaseStatus]) -> Result<()> {
-    let passed = summary
-      .iter()
-      .all(|c| matches!(c, CaseStatus::Validated | CaseStatus::Reported));
+    let passed = summary.iter().all(CaseStatus::is_pass);
     let style = Style::new().fg(Color::White).bold();
     let case_status = if summary.is_empty() {
       style.on(Color::Yellow).paint("SKIP")
@@ -72,9 +78,8 @@ pub(super) trait Reporter {
   }
 
   /// returns if should continue reporting
-  fn report_case_detail(&mut self, case_id: &str, result: &CaseStatus) -> Result<bool> {
-    report_case_detail_impl(self.get_output(), case_id, result)
-  }
+  /// user can mutate case_status to Updated in this function
+  fn report_case_detail(&mut self, case_id: &str, result: &mut CaseStatus) -> Result<bool>;
   fn collect_snapshot_action(&self) -> SnapshotAction;
 }
 
@@ -86,6 +91,7 @@ fn report_case_number(output: &mut impl Write, test_cases: &[TestCase]) -> Resul
 fn report_summary(summary: &[CaseStatus]) -> String {
   if summary.len() > 40 {
     let mut pass = 0;
+    let mut updated = 0;
     let mut wrong = 0;
     let mut missing = 0;
     let mut noisy = 0;
@@ -93,6 +99,7 @@ fn report_summary(summary: &[CaseStatus]) -> String {
     for s in summary {
       match s {
         CaseStatus::Validated | CaseStatus::Reported => pass += 1,
+        CaseStatus::Updated { .. } => updated += 1,
         CaseStatus::Wrong { .. } => wrong += 1,
         CaseStatus::Missing(_) => missing += 1,
         CaseStatus::Noisy(_) => noisy += 1,
@@ -101,6 +108,7 @@ fn report_summary(summary: &[CaseStatus]) -> String {
     }
     let stats = vec![
       ("Pass", pass),
+      ("Updated", updated),
       ("Wrong", wrong),
       ("Missing", missing),
       ("Noisy", noisy),
@@ -124,6 +132,7 @@ fn report_summary(summary: &[CaseStatus]) -> String {
       .map(|s| match s {
         CaseStatus::Validated | CaseStatus::Reported => '.',
         CaseStatus::Wrong { .. } => 'W',
+        CaseStatus::Updated { .. } => 'U',
         CaseStatus::Missing(_) => 'M',
         CaseStatus::Noisy(_) => 'N',
         CaseStatus::Error => 'E',
@@ -149,9 +158,19 @@ fn report_case_detail_impl<W: Write>(
   let missing = Style::new().underline().paint("Missing");
   let wrong = Style::new().underline().paint("Wrong");
   let error = Style::new().underline().paint("Error");
+  let update = Style::new().underline().paint("Updated");
   let styles = PrintStyles::from(ColorChoice::Auto);
   match result {
     CaseStatus::Validated | CaseStatus::Reported => (),
+    CaseStatus::Updated { source, .. } => {
+      writeln!(
+        output,
+        "[{update}] Rule {case_id}'s snapshot baseline has been updated."
+      )?;
+      writeln!(output)?;
+      indented_write(output, source)?;
+      writeln!(output)?;
+    }
     CaseStatus::Wrong {
       source,
       actual,
@@ -219,9 +238,15 @@ impl<O: Write> Reporter for DefaultReporter<O> {
   fn get_output(&mut self) -> &mut Self::Output {
     &mut self.output
   }
+  fn report_case_detail(&mut self, case_id: &str, result: &mut CaseStatus) -> Result<bool> {
+    if self.update_all {
+      result.accept();
+    }
+    report_case_detail_impl(self.get_output(), case_id, result)
+  }
   fn collect_snapshot_action(&self) -> SnapshotAction {
     if self.update_all {
-      SnapshotAction::AcceptAll
+      SnapshotAction::NeedUpdate
     } else {
       SnapshotAction::AcceptNone
     }
@@ -230,7 +255,6 @@ impl<O: Write> Reporter for DefaultReporter<O> {
 
 pub struct InteractiveReporter<Output: Write> {
   pub output: Output,
-  pub accepted_snapshots: SnapshotCollection,
   pub should_accept_all: bool,
 }
 
@@ -243,51 +267,42 @@ impl<O: Write> Reporter for InteractiveReporter<O> {
   }
 
   fn collect_snapshot_action(&self) -> SnapshotAction {
-    SnapshotAction::Selectively(self.accepted_snapshots.clone())
+    SnapshotAction::NeedUpdate
   }
 
-  fn report_case_detail(&mut self, case_id: &str, result: &CaseStatus) -> Result<bool> {
-    if matches!(result, CaseStatus::Validated | CaseStatus::Reported) {
+  fn report_case_detail(&mut self, case_id: &str, status: &mut CaseStatus) -> Result<bool> {
+    if matches!(status, CaseStatus::Validated | CaseStatus::Reported) {
       return Ok(true);
     }
     run_in_alternate_screen(|| {
-      report_case_detail_impl(self.get_output(), case_id, result)?;
-      if let CaseStatus::Wrong { source, actual, .. } = result {
-        let mut accept = || {
-          if let Some(existing) = self.accepted_snapshots.get_mut(case_id) {
-            existing
-              .snapshots
-              .insert(source.to_string(), actual.clone());
-          } else {
-            let mut snapshots = HashMap::new();
-            snapshots.insert(source.to_string(), actual.clone());
-            let shots = TestSnapshots {
-              id: case_id.to_string(),
-              snapshots,
-            };
-            self.accepted_snapshots.insert(case_id.to_string(), shots);
-          }
-          Ok(true)
-        };
-        if self.should_accept_all {
-          return accept();
-        }
-        let response = prompt(PROMPT, "ynaq", Some('n'))?;
-        match response {
-          'y' => accept(),
-          'n' => Ok(true),
-          'a' => {
-            self.should_accept_all = true;
-            accept()
-          }
-          'q' => Ok(false),
-          _ => unreachable!(),
-        }
-      } else {
+      report_case_detail_impl(self.get_output(), case_id, status)?;
+      if !matches!(status, CaseStatus::Wrong { .. }) {
         let response = prompt("Next[enter], Quit[q]", "q", Some('\n'))?;
-        Ok(response != 'q')
+        return Ok(response != 'q');
+      }
+      if self.should_accept_all {
+        return self.accept_new_snapshot(status);
+      }
+      let response = prompt(PROMPT, "ynaq", Some('n'))?;
+      match response {
+        'y' => self.accept_new_snapshot(status),
+        'n' => Ok(true),
+        'a' => {
+          self.should_accept_all = true;
+          self.accept_new_snapshot(status)
+        }
+        'q' => Ok(false),
+        _ => unreachable!(),
       }
     })
+  }
+}
+
+impl<O: Write> InteractiveReporter<O> {
+  fn accept_new_snapshot(&mut self, status: &mut CaseStatus) -> Result<bool> {
+    let accepted = status.accept();
+    debug_assert!(accepted, "status should be updated");
+    Ok(true)
   }
 }
 
@@ -352,8 +367,8 @@ mod test {
       output,
       update_all: false,
     };
-    reporter.report_case_detail(TEST_RULE, &CaseStatus::Reported)?;
-    reporter.report_case_detail(TEST_RULE, &CaseStatus::Validated)?;
+    reporter.report_case_detail(TEST_RULE, &mut CaseStatus::Reported)?;
+    reporter.report_case_detail(TEST_RULE, &mut CaseStatus::Validated)?;
     let s = String::from_utf8(reporter.output)?;
     assert_eq!(s, "");
     Ok(())
@@ -366,8 +381,8 @@ mod test {
       output,
       update_all: false,
     };
-    reporter.report_case_detail(TEST_RULE, &CaseStatus::Missing(MOCK))?;
-    reporter.report_case_detail(TEST_RULE, &CaseStatus::Noisy(MOCK))?;
+    reporter.report_case_detail(TEST_RULE, &mut CaseStatus::Missing(MOCK))?;
+    reporter.report_case_detail(TEST_RULE, &mut CaseStatus::Noisy(MOCK))?;
     let s = String::from_utf8(reporter.output)?;
     assert!(s.contains("Missing"));
     assert!(s.contains("Noisy"));

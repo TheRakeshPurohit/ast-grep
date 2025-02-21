@@ -8,7 +8,7 @@ use bit_set::BitSet;
 use thiserror::Error;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 pub struct Registration<R>(Arc<RwLock<HashMap<String, R>>>);
@@ -41,7 +41,7 @@ impl<L: Language> GlobalRules<L> {
     // TODO: we can skip check here because insertion order
     // is guaranteed in deserialize_env
     if rule.check_cyclic(id) {
-      return Err(ReferentRuleError::CyclicRule);
+      return Err(ReferentRuleError::CyclicRule(id.to_string()));
     }
     Ok(())
   }
@@ -55,9 +55,12 @@ impl<R> Default for Registration<R> {
 
 #[derive(Clone)]
 pub struct RuleRegistration<L: Language> {
+  /// utility rule to every RuleCore, every sub-rule has its own local utility
   local: Registration<Rule<L>>,
+  /// global rules are shared by all RuleConfigs. It is a singleton.
   global: Registration<RuleCore<L>>,
-  rewrites: Registration<RuleCore<L>>,
+  /// Every RuleConfig has its own rewriters. But sub-rules share parent's rewriters.
+  rewriters: Registration<RuleCore<L>>,
 }
 
 // these are shit code
@@ -70,15 +73,15 @@ impl<L: Language> RuleRegistration<L> {
     self.global.read()
   }
 
-  pub fn get_rewrites(&self) -> GlobalRules<L> {
-    self.rewrites.clone()
+  pub fn get_rewriters(&self) -> GlobalRules<L> {
+    self.rewriters.clone()
   }
 
   pub fn from_globals(global: &GlobalRules<L>) -> Self {
     Self {
       local: Default::default(),
       global: global.clone(),
-      rewrites: Default::default(),
+      rewriters: Default::default(),
     }
   }
 
@@ -86,7 +89,7 @@ impl<L: Language> RuleRegistration<L> {
     Self {
       local: self.local.clone(),
       global: self.global.clone(),
-      rewrites: rewriters.clone(),
+      rewriters: rewriters.clone(),
     }
   }
 
@@ -106,19 +109,22 @@ impl<L: Language> RuleRegistration<L> {
     // TODO: we can skip check here because insertion order
     // is guaranteed in deserialize_env
     if rule.check_cyclic(id) {
-      return Err(ReferentRuleError::CyclicRule);
+      return Err(ReferentRuleError::CyclicRule(id.to_string()));
     }
     Ok(())
   }
 
-  pub fn insert_rewrite(&self, id: &str, rewrite: RuleCore<L>) -> Result<(), ReferentRuleError> {
-    let mut map = self.rewrites.write();
-    if map.contains_key(id) {
-      return Err(ReferentRuleError::DuplicateRule(id.into()));
+  pub(crate) fn get_local_util_vars<'a>(&'a self) -> HashSet<&'a str> {
+    let mut ret = HashSet::new();
+    let utils = self.get_local();
+    for rule in utils.values() {
+      // SAFETY: self will retain the reg_ref and guarantee &Rule is valid
+      let rule = unsafe { &*(rule as *const Rule<L>) as &'a Rule<L> };
+      for v in rule.defined_vars() {
+        ret.insert(v);
+      }
     }
-    map.insert(id.to_string(), rewrite);
-    // TODO: add cyclic rewrite check?
-    Ok(())
+    ret
   }
 }
 impl<L: Language> Default for RuleRegistration<L> {
@@ -126,7 +132,7 @@ impl<L: Language> Default for RuleRegistration<L> {
     Self {
       local: Default::default(),
       global: Default::default(),
-      rewrites: Default::default(),
+      rewriters: Default::default(),
     }
   }
 }
@@ -143,19 +149,19 @@ impl<L: Language> RegistrationRef<L> {
     RuleRegistration {
       local,
       global,
-      rewrites: Default::default(),
+      rewriters: Default::default(),
     }
   }
 }
 
 #[derive(Debug, Error)]
 pub enum ReferentRuleError {
-  #[error("Rule `{0}` is not found.")]
-  RuleNotFound(String),
+  #[error("Rule `{0}` is not defined.")]
+  UndefinedUtil(String),
   #[error("Duplicate rule id `{0}` is found.")]
   DuplicateRule(String),
-  #[error("Rule has a cyclic dependency in its `matches` sub-rule.")]
-  CyclicRule,
+  #[error("Rule `{0}` has a cyclic dependency in its `matches` sub-rule.")]
+  CyclicRule(String),
 }
 
 pub struct ReferentRule<L: Language> {
@@ -192,6 +198,19 @@ impl<L: Language> ReferentRule<L> {
     let rules = registration.get_global();
     let rule = rules.get(&self.rule_id)?;
     Some(func(rule))
+  }
+
+  pub(super) fn verify_util(&self) -> Result<(), ReferentRuleError> {
+    let registration = self.reg_ref.unref();
+    let rules = registration.get_local();
+    if rules.contains_key(&self.rule_id) {
+      return Ok(());
+    }
+    let rules = registration.get_global();
+    if rules.contains_key(&self.rule_id) {
+      return Ok(());
+    }
+    Err(ReferentRuleError::UndefinedUtil(self.rule_id.clone()))
   }
 }
 
@@ -238,7 +257,7 @@ mod test {
     let rule = ReferentRule::try_new("test".into(), &registration)?;
     let rule = Rule::Matches(rule);
     let error = registration.insert_local("test", rule);
-    assert!(matches!(error, Err(ReferentRuleError::CyclicRule)));
+    assert!(matches!(error, Err(ReferentRuleError::CyclicRule(_))));
     Ok(())
   }
 
@@ -248,7 +267,17 @@ mod test {
     let rule = ReferentRule::try_new("test".into(), &registration)?;
     let rule = Rule::All(o::All::new(std::iter::once(Rule::Matches(rule))));
     let error = registration.insert_local("test", rule);
-    assert!(matches!(error, Err(ReferentRuleError::CyclicRule)));
+    assert!(matches!(error, Err(ReferentRuleError::CyclicRule(_))));
+    Ok(())
+  }
+
+  #[test]
+  fn test_cyclic_not() -> Result {
+    let registration = RuleRegistration::<TS>::default();
+    let rule = ReferentRule::try_new("test".into(), &registration)?;
+    let rule = Rule::Not(Box::new(o::Not::new(Rule::Matches(rule))));
+    let error = registration.insert_local("test", rule);
+    assert!(matches!(error, Err(ReferentRuleError::CyclicRule(_))));
     Ok(())
   }
 

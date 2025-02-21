@@ -19,6 +19,22 @@ fn test_python_str() {
   test_match("print('123')", "print('123')");
   test_non_match("print('123')", "print('456')");
   test_non_match("'123'", "'456'");
+  // https://github.com/ast-grep/ast-grep/issues/276
+  // python has fixed the wrong parsing issue
+  test_non_match(
+    "getattr($O, \"__spec__\", None)",
+    "getattr(response, \"render\", None)",
+  );
+  test_match(
+    "getattr($O, \"render\", None)",
+    "getattr(response, \"render\", None)",
+  );
+}
+
+// https://github.com/ast-grep/ast-grep/issues/883
+#[test]
+fn test_issue_883() {
+  test_match("r'^[A-Za-z0-9_-]+\\$'", "r'^[A-Za-z0-9_-]+\\$'");
 }
 
 #[test]

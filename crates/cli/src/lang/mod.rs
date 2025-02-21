@@ -1,8 +1,13 @@
-mod custom_lang;
+mod injection;
 mod lang_globs;
 
-use anyhow::Result;
-use ast_grep_core::language::TSLanguage;
+use crate::utils::ErrorContext as EC;
+
+use anyhow::{Context, Result};
+use ast_grep_core::{
+  language::{TSLanguage, TSRange},
+  Doc, Node,
+};
 use ast_grep_dynamic::DynamicLang;
 use ast_grep_language::{Language, SupportLang};
 use ignore::types::Types;
@@ -11,13 +16,14 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
-pub use custom_lang::CustomLang;
+pub use ast_grep_dynamic::CustomLang;
+pub use injection::SerializableInjection;
 pub use lang_globs::LanguageGlobs;
 
-#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(untagged)]
 pub enum SgLang {
   // inlined support lang expando char
@@ -31,12 +37,12 @@ impl SgLang {
       Builtin(b) => b.file_types(),
       Custom(c) => c.file_types(),
     };
-    lang_globs::merge_types(self, default_types)
+    lang_globs::merge_globs(self, default_types)
   }
 
   // register_globs must be called after register_custom_language
-  pub fn register_custom_language(base: PathBuf, langs: HashMap<String, CustomLang>) {
-    CustomLang::register(base, langs)
+  pub fn register_custom_language(base: &Path, langs: HashMap<String, CustomLang>) -> Result<()> {
+    CustomLang::register(base, langs).context(EC::CustomLanguage)
   }
 
   // TODO: add tests
@@ -48,10 +54,41 @@ impl SgLang {
     Ok(())
   }
 
+  pub fn register_injections(injections: Vec<SerializableInjection>) -> Result<()> {
+    unsafe { injection::register_injetables(injections) }
+  }
+
   pub fn all_langs() -> Vec<Self> {
     let builtin = SupportLang::all_langs().iter().copied().map(Self::Builtin);
     let customs = DynamicLang::all_langs().into_iter().map(Self::Custom);
     builtin.chain(customs).collect()
+  }
+
+  pub fn injectable_sg_langs(&self) -> Option<impl Iterator<Item = Self>> {
+    let langs = self.injectable_languages()?;
+    // TODO: handle injected languages not found
+    // e.g vue can inject scss which is not supported by sg
+    // we should report an error here
+    let iter = langs.iter().filter_map(|s| SgLang::from_str(s).ok());
+    Some(iter)
+  }
+
+  pub fn augmented_file_type(&self) -> Types {
+    let self_type = self.file_types();
+    let injector = Self::all_langs().into_iter().filter_map(|lang| {
+      lang
+        .injectable_sg_langs()?
+        .any(|l| l == *self)
+        .then_some(lang)
+    });
+    let injector_types = injector.map(|lang| lang.file_types());
+    let all_types = std::iter::once(self_type).chain(injector_types);
+    lang_globs::merge_types(all_types)
+  }
+
+  pub fn file_types_for_langs(langs: impl Iterator<Item = Self>) -> Types {
+    let types = langs.map(|lang| lang.augmented_file_type());
+    lang_globs::merge_types(types)
   }
 }
 
@@ -107,6 +144,11 @@ impl From<SupportLang> for SgLang {
     Self::Builtin(value)
   }
 }
+impl From<DynamicLang> for SgLang {
+  fn from(value: DynamicLang) -> Self {
+    Self::Custom(value)
+  }
+}
 
 use SgLang::*;
 impl Language for SgLang {
@@ -147,6 +189,14 @@ impl Language for SgLang {
       Builtin(b) => b.expando_char(),
       Custom(c) => c.expando_char(),
     }
+  }
+
+  fn injectable_languages(&self) -> Option<&'static [&'static str]> {
+    injection::injectable_languages(*self)
+  }
+
+  fn extract_injections<D: Doc>(&self, root: Node<D>) -> HashMap<String, Vec<TSRange>> {
+    injection::extract_injections(root)
   }
 }
 

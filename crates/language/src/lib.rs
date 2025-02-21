@@ -13,6 +13,8 @@ mod csharp;
 mod css;
 mod elixir;
 mod go;
+mod haskell;
+mod html;
 mod json;
 mod kotlin;
 mod lua;
@@ -23,14 +25,21 @@ mod ruby;
 mod rust;
 mod scala;
 mod swift;
+mod yaml;
 
-use ast_grep_core::language::TSLanguage;
+pub use html::Html;
+
+use ast_grep_core::language::{TSLanguage, TSRange};
 use ast_grep_core::meta_var::MetaVariable;
+use ast_grep_core::{Doc, Node};
 use ignore::types::{Types, TypesBuilder};
+use serde::de::Visitor;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Display, Formatter};
+use std::iter::repeat;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -39,7 +48,7 @@ pub use ast_grep_core::Language;
 /// this macro implements bare-bone methods for a language
 macro_rules! impl_lang {
   ($lang: ident, $func: ident) => {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     pub struct $lang;
     impl Language for $lang {
       fn get_ts_language(&self) -> TSLanguage {
@@ -49,11 +58,32 @@ macro_rules! impl_lang {
   };
 }
 
+fn pre_process_pattern(expando: char, query: &str) -> std::borrow::Cow<str> {
+  let mut ret = Vec::with_capacity(query.len());
+  let mut dollar_count = 0;
+  for c in query.chars() {
+    if c == '$' {
+      dollar_count += 1;
+      continue;
+    }
+    let need_replace = matches!(c, 'A'..='Z' | '_') // $A or $$A or $$$A
+      || dollar_count == 3; // anonymous multiple
+    let sigil = if need_replace { expando } else { '$' };
+    ret.extend(repeat(sigil).take(dollar_count));
+    dollar_count = 0;
+    ret.push(c);
+  }
+  // trailing anonymous multiple
+  let sigil = if dollar_count == 3 { expando } else { '$' };
+  ret.extend(repeat(sigil).take(dollar_count));
+  std::borrow::Cow::Owned(ret.into_iter().collect())
+}
+
 /// this macro will implement expando_char and pre_process_pattern
 /// use this if your language does not accept $ as valid identifier char
 macro_rules! impl_lang_expando {
   ($lang: ident, $func: ident, $char: expr) => {
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     pub struct $lang;
     impl ast_grep_core::language::Language for $lang {
       fn get_ts_language(&self) -> ast_grep_core::language::TSLanguage {
@@ -63,12 +93,54 @@ macro_rules! impl_lang_expando {
         $char
       }
       fn pre_process_pattern<'q>(&self, query: &'q str) -> std::borrow::Cow<'q, str> {
-        // use stack buffer to reduce allocation
-        let mut buf = [0; 4];
-        let expando = self.expando_char().encode_utf8(&mut buf);
-        // TODO: use more precise replacement
-        let replaced = query.replace(self.meta_var_char(), expando);
-        std::borrow::Cow::Owned(replaced)
+        pre_process_pattern(self.expando_char(), query)
+      }
+    }
+  };
+}
+
+/// Implements the `ALIAS` associated constant for the given lang, which is
+/// then used to define the `alias` const fn and a `Deserialize` impl.
+macro_rules! impl_alias {
+  ($lang:ident => $as:expr) => {
+    impl $lang {
+      pub const ALIAS: &'static [&'static str] = $as;
+    }
+
+    impl fmt::Display for $lang {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+      }
+    }
+
+    impl<'de> Deserialize<'de> for $lang {
+      fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      where
+        D: Deserializer<'de>,
+      {
+        let vis = AliasVisitor {
+          aliases: Self::ALIAS,
+        };
+        deserializer.deserialize_str(vis)?;
+        Ok($lang)
+      }
+    }
+
+    impl From<$lang> for SupportLang {
+      fn from(_: $lang) -> Self {
+        Self::$lang
+      }
+    }
+  };
+}
+/// Generates as convenience conversions between the lang types
+/// and `SupportedType`.
+macro_rules! impl_aliases {
+  ($($lang:ident => $as:expr),* $(,)?) => {
+    $(impl_alias!($lang => $as);)*
+    const fn alias(lang: SupportLang) -> &'static [&'static str] {
+      match lang {
+        $(SupportLang::$lang => $lang::ALIAS),*
       }
     }
   };
@@ -91,8 +163,14 @@ impl_lang_expando!(Elixir, language_elixir, 'µ');
 // we can use any Unicode code point categorized as "Letter"
 // https://go.dev/ref/spec#letter
 impl_lang_expando!(Go, language_go, 'µ');
+// GHC supports Unicode syntax per
+// https://ghc.gitlab.haskell.org/ghc/doc/users_guide/exts/unicode_syntax.html
+// and the tree-sitter-haskell grammar parses it too.
+impl_lang_expando!(Haskell, language_haskell, 'µ');
 // https://github.com/fwcd/tree-sitter-kotlin/pull/93
 impl_lang_expando!(Kotlin, language_kotlin, 'µ');
+// PHP accepts unicode to be used as some name not var name though
+impl_lang_expando!(Php, language_php, 'µ');
 // we can use any char in unicode range [:XID_Start:]
 // https://docs.python.org/3/reference/lexical_analysis.html#identifiers
 // see also [PEP 3131](https://peps.python.org/pep-3131/) for further details.
@@ -108,16 +186,14 @@ impl_lang_expando!(Swift, language_swift, 'µ');
 // Stub Language without preprocessing
 // Language Name, tree-sitter-name, alias, extension
 impl_lang!(Bash, language_bash);
-impl_lang!(Dart, language_dart);
-impl_lang!(Html, language_html);
 impl_lang!(Java, language_java);
 impl_lang!(JavaScript, language_javascript);
 impl_lang!(Json, language_json);
 impl_lang!(Lua, language_lua);
-impl_lang!(Php, language_php);
 impl_lang!(Scala, language_scala);
 impl_lang!(Tsx, language_tsx);
 impl_lang!(TypeScript, language_typescript);
+impl_lang!(Yaml, language_yaml);
 // See ripgrep for extensions
 // https://github.com/BurntSushi/ripgrep/blob/master/crates/ignore/src/default_types.rs
 
@@ -129,9 +205,9 @@ pub enum SupportLang {
   Cpp,
   CSharp,
   Css,
-  Dart,
   Go,
   Elixir,
+  Haskell,
   Html,
   Java,
   JavaScript,
@@ -146,24 +222,25 @@ pub enum SupportLang {
   Swift,
   Tsx,
   TypeScript,
+  Yaml,
 }
 
 impl SupportLang {
   pub const fn all_langs() -> &'static [SupportLang] {
     use SupportLang::*;
     &[
-      Bash, C, Cpp, CSharp, Css, Dart, Elixir, Go, Html, Java, JavaScript, Json, Kotlin, Lua, Php,
-      Python, Ruby, Rust, Scala, Swift, Tsx, TypeScript,
+      Bash, C, Cpp, CSharp, Css, Elixir, Go, Haskell, Html, Java, JavaScript, Json, Kotlin, Lua,
+      Php, Python, Ruby, Rust, Scala, Swift, Tsx, TypeScript, Yaml,
     ]
   }
 
   pub fn file_types(&self) -> Types {
-    file_types(self)
+    file_types(*self)
   }
 }
 
 impl fmt::Display for SupportLang {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "{:?}", self)
   }
 }
@@ -189,47 +266,84 @@ impl<'de> Deserialize<'de> for SupportLang {
   where
     D: Deserializer<'de>,
   {
-    let s = String::deserialize(deserializer)?;
-    FromStr::from_str(&s).map_err(de::Error::custom)
+    deserializer.deserialize_str(SupportLangVisitor)
   }
 }
 
-const fn alias(lang: &SupportLang) -> &[&str] {
-  use SupportLang::*;
-  match lang {
-    Bash => &["bash-exp"],
-    C => &["c"],
-    Cpp => &["cc", "c++", "cpp", "cxx"],
-    CSharp => &["cs", "csharp"],
-    Css => &["css"],
-    Dart => &["dart"],
-    Elixir => &["ex", "elixir"],
-    Go => &["go", "golang"],
-    Html => &["html"],
-    Java => &["java"],
-    JavaScript => &["javascript", "js", "jsx"],
-    Json => &["json"],
-    Kotlin => &["kotlin", "kt"],
-    Lua => &["lua"],
-    Php => &["php-exp"],
-    Python => &["py", "python"],
-    Ruby => &["rb", "ruby"],
-    Rust => &["rs", "rust"],
-    Scala => &["scala"],
-    Swift => &["swift"],
-    TypeScript => &["ts", "typescript"],
-    Tsx => &["tsx"],
+struct SupportLangVisitor;
+
+impl Visitor<'_> for SupportLangVisitor {
+  type Value = SupportLang;
+
+  fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    f.write_str("SupportLang")
   }
+
+  fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+  where
+    E: de::Error,
+  {
+    v.parse().map_err(de::Error::custom)
+  }
+}
+struct AliasVisitor {
+  aliases: &'static [&'static str],
+}
+
+impl Visitor<'_> for AliasVisitor {
+  type Value = &'static str;
+
+  fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "one of {:?}", self.aliases)
+  }
+
+  fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+  where
+    E: de::Error,
+  {
+    self
+      .aliases
+      .iter()
+      .copied()
+      .find(|&a| v.eq_ignore_ascii_case(a))
+      .ok_or_else(|| de::Error::invalid_value(de::Unexpected::Str(v), &self))
+  }
+}
+
+impl_aliases! {
+  Bash => &["bash"],
+  C => &["c"],
+  Cpp => &["cc", "c++", "cpp", "cxx"],
+  CSharp => &["cs", "csharp"],
+  Css => &["css"],
+  Elixir => &["ex", "elixir"],
+  Go => &["go", "golang"],
+  Haskell => &["hs", "haskell"],
+  Html => &["html"],
+  Java => &["java"],
+  JavaScript => &["javascript", "js", "jsx"],
+  Json => &["json"],
+  Kotlin => &["kotlin", "kt"],
+  Lua => &["lua"],
+  Php => &["php"],
+  Python => &["py", "python"],
+  Ruby => &["rb", "ruby"],
+  Rust => &["rs", "rust"],
+  Scala => &["scala"],
+  Swift => &["swift"],
+  TypeScript => &["ts", "typescript"],
+  Tsx => &["tsx"],
+  Yaml => &["yaml", "yml"],
 }
 
 /// Implements the language names and aliases.
 impl FromStr for SupportLang {
   type Err = SupportLangErr;
   fn from_str(s: &str) -> Result<Self, Self::Err> {
-    for lang in Self::all_langs() {
+    for &lang in Self::all_langs() {
       for moniker in alias(lang) {
         if s.eq_ignore_ascii_case(moniker) {
-          return Ok(*lang);
+          return Ok(lang);
         }
       }
     }
@@ -246,9 +360,9 @@ macro_rules! execute_lang_method {
       S::Cpp => Cpp.$method($($pname,)*),
       S::CSharp => CSharp.$method($($pname,)*),
       S::Css => Css.$method($($pname,)*),
-      S::Dart => Dart.$method($($pname,)*),
       S::Elixir => Elixir.$method($($pname,)*),
       S::Go => Go.$method($($pname,)*),
+      S::Haskell => Haskell.$method($($pname,)*),
       S::Html => Html.$method($($pname,)*),
       S::Java => Java.$method($($pname,)*),
       S::JavaScript => JavaScript.$method($($pname,)*),
@@ -263,6 +377,7 @@ macro_rules! execute_lang_method {
       S::Swift => Swift.$method($($pname,)*),
       S::Tsx => Tsx.$method($($pname,)*),
       S::TypeScript => TypeScript.$method($($pname,)*),
+      S::Yaml => Yaml.$method($($pname,)*),
     }
   }
 }
@@ -285,13 +400,21 @@ impl Language for SupportLang {
   impl_lang_method!(meta_var_char, () => char);
   impl_lang_method!(expando_char, () => char);
   impl_lang_method!(extract_meta_var, (source: &str) => Option<MetaVariable>);
+  impl_lang_method!(injectable_languages, () => Option<&'static [&'static str]>);
+
+  fn extract_injections<D: Doc>(&self, root: Node<D>) -> HashMap<String, Vec<TSRange>> {
+    match self {
+      SupportLang::Html => Html.extract_injections(root),
+      _ => HashMap::new(),
+    }
+  }
 
   fn pre_process_pattern<'q>(&self, query: &'q str) -> Cow<'q, str> {
     execute_lang_method! { self, pre_process_pattern, query }
   }
 }
 
-fn extensions(lang: &SupportLang) -> &[&str] {
+fn extensions(lang: SupportLang) -> &'static [&'static str] {
   use SupportLang::*;
   match lang {
     Bash => &[
@@ -301,9 +424,9 @@ fn extensions(lang: &SupportLang) -> &[&str] {
     Cpp => &["cc", "hpp", "cpp", "c++", "hh", "cxx", "cu", "ino"],
     CSharp => &["cs"],
     Css => &["css", "scss"],
-    Dart => &["dart"],
     Elixir => &["ex", "exs"],
     Go => &["go"],
+    Haskell => &["hs"],
     Html => &["html", "htm", "xhtml"],
     Java => &["java"],
     JavaScript => &["cjs", "js", "mjs", "jsx"],
@@ -318,6 +441,7 @@ fn extensions(lang: &SupportLang) -> &[&str] {
     Swift => &["swift"],
     TypeScript => &["ts", "cts", "mts"],
     Tsx => &["tsx"],
+    Yaml => &["yaml", "yml"],
   }
 }
 
@@ -329,7 +453,7 @@ fn from_extension(path: &Path) -> Option<SupportLang> {
   SupportLang::all_langs()
     .iter()
     .copied()
-    .find(|l| extensions(l).contains(&ext))
+    .find(|&l| extensions(l).contains(&ext))
 }
 
 fn add_custom_file_type<'b>(
@@ -346,7 +470,7 @@ fn add_custom_file_type<'b>(
   builder.select(file_type)
 }
 
-fn file_types(lang: &SupportLang) -> Types {
+fn file_types(lang: SupportLang) -> Types {
   let mut builder = TypesBuilder::new();
   let exts = extensions(lang);
   let lang_name = lang.to_string();
@@ -384,6 +508,7 @@ mod test {
       cand.root().to_sexp(),
     );
   }
+
   pub fn test_replace_lang(
     src: &str,
     pattern: &str,

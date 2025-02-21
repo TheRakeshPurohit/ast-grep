@@ -4,9 +4,9 @@ mod reporter;
 mod snapshot;
 mod test_case;
 
-use crate::config::{find_rules, register_custom_language};
-use crate::error::ErrorContext;
+use crate::config::ProjectConfig;
 use crate::lang::SgLang;
+use crate::utils::ErrorContext;
 use anyhow::{anyhow, Result};
 use ast_grep_config::RuleCollection;
 use ast_grep_core::{Node as SgNode, StrDoc};
@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use case_result::{CaseResult, CaseStatus};
-use find_file::{find_tests, read_test_files, TestHarness};
+use find_file::TestHarness;
 use reporter::{DefaultReporter, InteractiveReporter, Reporter};
 use snapshot::{SnapshotAction, SnapshotCollection, TestSnapshots};
 use test_case::TestCase;
@@ -34,8 +34,10 @@ where
   R: Send,
   F: FnMut(&'a T) -> Option<R> + Send + Copy,
 {
-  let cpu_count = num_cpus::get().min(12);
-  let chunk_size = (cases.len() + cpu_count) / cpu_count;
+  let threads = std::thread::available_parallelism()
+    .map_or(1, |n| n.get())
+    .min(12);
+  let chunk_size = (cases.len() + threads) / threads;
   thread::scope(|s| {
     cases
       .chunks(chunk_size)
@@ -54,23 +56,21 @@ where
   })
 }
 
-fn run_test_rule_impl<R: Reporter + Send>(arg: TestArg, reporter: R) -> Result<()> {
-  let collections = &find_rules(arg.config.clone(), None)?;
+fn run_test_rule_impl<R: Reporter + Send>(
+  arg: TestArg,
+  reporter: R,
+  project: ProjectConfig,
+) -> Result<()> {
+  let collections = &project.find_rules(Default::default())?.0;
   let TestHarness {
     test_cases,
     snapshots,
     path_map,
   } = if let Some(test_dirname) = arg.test_dir {
-    let base_dir = std::env::current_dir()?;
     let snapshot_dirname = arg.snapshot_dir.as_deref();
-    read_test_files(
-      &base_dir,
-      &test_dirname,
-      snapshot_dirname,
-      arg.filter.as_ref(),
-    )?
+    TestHarness::from_dir(&test_dirname, snapshot_dirname, arg.filter.as_ref())?
   } else {
-    find_tests(arg.config, arg.filter.as_ref())?
+    TestHarness::from_config(project, arg.filter.as_ref())?
   };
   let snapshots = (!arg.skip_snapshot_tests).then_some(snapshots);
   let reporter = &Arc::new(Mutex::new(reporter));
@@ -80,28 +80,25 @@ fn run_test_rule_impl<R: Reporter + Send>(arg: TestArg, reporter: R) -> Result<(
 
   let check_one_case = |case| {
     let result = verify_test_case_simple(case, collections, snapshots.as_ref());
-    let mut reporter = reporter.lock().unwrap();
-    if let Some(result) = result {
-      reporter
-        .report_case_summary(&case.id, &result.cases)
-        .unwrap();
-      Some(result)
-    } else {
+    if result.is_none() {
+      let mut reporter = reporter.lock().unwrap();
       let output = reporter.get_output();
       writeln!(output, "Configuration not found! {}", case.id).unwrap();
-      None
     }
+    result
   };
-  let results = parallel_collect(&test_cases, check_one_case);
+  let mut results = parallel_collect(&test_cases, check_one_case);
   let mut reporter = reporter.lock().unwrap();
+
+  reporter.report_failed_cases(&mut results)?;
+  let action = reporter.collect_snapshot_action();
+  apply_snapshot_action(action, &results, snapshots, path_map)?;
+  reporter.report_summaries(&results)?;
   let (passed, message) = reporter.after_report(&results)?;
   if passed {
     writeln!(reporter.get_output(), "{message}",)?;
     Ok(())
   } else {
-    reporter.report_failed_cases(&results)?;
-    let action = reporter.collect_snapshot_action();
-    apply_snapshot_action(action, &results, snapshots, path_map)?;
     Err(anyhow!(ErrorContext::TestFail(message)))
   }
 }
@@ -163,9 +160,6 @@ fn verify_test_case_simple<'a>(
 
 #[derive(Args)]
 pub struct TestArg {
-  /// Path to the root ast-grep config YAML
-  #[clap(short, long)]
-  config: Option<PathBuf>,
   /// the directories to search test YAML files
   #[clap(short, long)]
   test_dir: Option<PathBuf>,
@@ -189,21 +183,20 @@ pub struct TestArg {
   filter: Option<Regex>,
 }
 
-pub fn run_test_rule(arg: TestArg) -> Result<()> {
-  register_custom_language(arg.config.clone())?;
+pub fn run_test_rule(arg: TestArg, project: Result<ProjectConfig>) -> Result<()> {
+  let project = project?;
   if arg.interactive {
     let reporter = InteractiveReporter {
       output: std::io::stdout(),
-      accepted_snapshots: HashMap::new(),
       should_accept_all: false,
     };
-    run_test_rule_impl(arg, reporter)
+    run_test_rule_impl(arg, reporter, project)
   } else {
     let reporter = DefaultReporter {
       output: std::io::stdout(),
       update_all: arg.update_all,
     };
-    run_test_rule_impl(arg, reporter)
+    run_test_rule_impl(arg, reporter, project)
   }
 }
 
@@ -234,12 +227,12 @@ rule:
   }
   fn always_report_rule() -> RuleCollection<SgLang> {
     // empty all should mean always
-    let rule = get_rule_config("all: []");
+    let rule = get_rule_config("all: [kind: number]");
     RuleCollection::try_new(vec![rule]).expect("RuleCollection must be valid")
   }
   fn never_report_rule() -> RuleCollection<SgLang> {
     // empty any should mean never
-    let rule = get_rule_config("any: []");
+    let rule = get_rule_config("any: [kind: string]");
     RuleCollection::try_new(vec![rule]).expect("RuleCollection must be valid")
   }
 
@@ -308,15 +301,9 @@ rule:
     assert!(ret.is_none());
   }
 
-  use codespan_reporting::term::termcolor::Buffer;
   #[test]
   fn test_run_verify_error() {
-    let reporter = DefaultReporter {
-      output: Buffer::no_color(),
-      update_all: false,
-    };
     let arg = TestArg {
-      config: None,
       interactive: false,
       skip_snapshot_tests: true,
       snapshot_dir: None,
@@ -324,7 +311,7 @@ rule:
       update_all: false,
       filter: None,
     };
-    assert!(run_test_rule_impl(arg, reporter).is_err());
+    assert!(run_test_rule(arg, Err(anyhow!("error"))).is_err());
   }
   const TRANSFORM_TEXT: &str = "
 transform:

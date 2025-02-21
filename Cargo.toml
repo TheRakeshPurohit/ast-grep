@@ -11,28 +11,29 @@ resolver = "2"
 lto = true
 
 [workspace.package]
-version = "0.17.1"
+version = "0.35.0"
 authors = ["Herrington Darkholme <2883231+HerringtonDarkholme@users.noreply.github.com>"]
 edition = "2021"
 license = "MIT"
 documentation = "https://ast-grep.github.io/guide/introduction.html"
 homepage = "https://ast-grep.github.io/"
 repository = "https://github.com/ast-grep/ast-grep"
-rust-version = "1.63"
+rust-version = "1.67"
 readme = "README.md"
 
 [workspace.dependencies]
-ast-grep-core = { path = "crates/core", version = "0.17.1" }
-ast-grep-config = { path = "crates/config", version = "0.17.1" }
-ast-grep-dynamic = { path = "crates/dynamic", version = "0.17.1" }
-ast-grep-language = { path = "crates/language", version = "0.17.1" }
-ast-grep-lsp = { path = "crates/lsp", version = "0.17.1" }
+ast-grep-core = { path = "crates/core", version = "0.35.0" }
+ast-grep-config = { path = "crates/config", version = "0.35.0" }
+ast-grep-dynamic = { path = "crates/dynamic", version = "0.35.0" }
+ast-grep-language = { path = "crates/language", version = "0.35.0" }
+ast-grep-lsp = { path = "crates/lsp", version = "0.35.0" }
 
-bit-set = { version = "0.5.3" }
+bit-set = { version = "0.8.0" }
 ignore = { version = "0.4.22" }
-regex = { version = "1.10.3" }
-serde = { version = "1.0", features = ["derive"] }
-tree-sitter = { version = "0.9.2", package = "tree-sitter-facade-sg" }
-thiserror = "1.0.56"
-schemars = "0.8.16"
-anyhow = "1.0.79"
+regex = { version = "1.10.4" }
+serde = { version = "1.0.200", features = ["derive"] }
+serde_yaml = "0.9.33"
+tree-sitter = { version = "0.24.5", package = "tree-sitter-facade-sg" }
+thiserror = "2.0.0"
+schemars = "0.8.17"
+anyhow = "1.0.82"

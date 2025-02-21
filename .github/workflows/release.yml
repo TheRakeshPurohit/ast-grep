@@ -55,13 +55,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: sg
+          bin: sg,ast-grep
           tar: none
           # (optional) On which platform to distribute the `.zip` file.
           # [default value: windows]
           # [possible values: all, unix, windows, none]
           zip: all
           target: ${{ matrix.target }}
+          archive: app-$target
           # uncomment this for debug
           # ref: refs/tags/debug_release
         env:
@@ -77,7 +78,7 @@ jobs:
       - name: Setup node
         uses: actions/setup-node@v4
       - name: Download artifacts
-        uses: robinraju/release-downloader@v1.9
+        uses: robinraju/release-downloader@v1.11
         with:
           latest: true
           fileName: "*.zip"
@@ -89,7 +90,7 @@ jobs:
           length=${#files[@]}
           for (( i=0; i<${length}; i++ ));
           do
-            unzip "artifacts/sg-${files[$i]}.zip" -d "npm/platforms/${target_dir[$i]}/"
+            unzip "artifacts/app-${files[$i]}.zip" -d "npm/platforms/${target_dir[$i]}/"
           done
           # windows
           files=(x86_64-pc-windows-msvc i686-pc-windows-msvc aarch64-pc-windows-msvc)
@@ -97,7 +98,7 @@ jobs:
           length=${#files[@]}
           for (( i=0; i<${length}; i++ ));
           do
-            unzip "artifacts/sg-${files[$i]}.zip" -d "npm/platforms/${target_dir[$i]}/"
+            unzip "artifacts/app-${files[$i]}.zip" -d "npm/platforms/${target_dir[$i]}/"
           done
       - run: echo //registry.npmjs.org/:_authToken=${NPM_TOKEN} > ~/.npmrc
         env:

@@ -19,7 +19,7 @@ concurrency:
 
 env:
   PACKAGE_NAME: ast_grep_cli # note: maturin package name only accepts underscore
-  PYTHON_VERSION: "3.8" # to build abi3 wheels
+  PYTHON_VERSION: "3.9" # to build abi3 wheels
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
@@ -40,17 +40,17 @@ jobs:
           args: --out dist
       - name: "Test sdist"
         run: |
-          rustup default $(cat rust-toolchain)
           pip install dist/${{ env.PACKAGE_NAME }}-*.tar.gz --force-reinstall
           sg --help
       - name: "Upload sdist"
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: wheels
           path: dist
 
   macos-x86_64:
-    runs-on: macos-latest
+    # use old macos due to https://github.com/actions/setup-python/issues/852
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -71,13 +71,14 @@ jobs:
           pip install dist/${{ env.PACKAGE_NAME }}-*.whl --force-reinstall
           sg --help
       - name: "Upload wheels"
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: wheels-macos-x86_64
           path: dist
 
   macos-universal:
-    runs-on: macos-latest
+    # use old macos due to https://github.com/actions/setup-python/issues/852
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -96,9 +97,9 @@ jobs:
           pip install dist/${{ env.PACKAGE_NAME }}-*universal2.whl --force-reinstall
           sg --help
       - name: "Upload wheels"
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: wheels-aarch64-apple-darwin
           path: dist
 
   windows:
@@ -120,6 +121,9 @@ jobs:
           architecture: ${{ matrix.platform.arch }}
       - name: "Build wheels"
         uses: PyO3/maturin-action@v1
+        env:
+          # https://github.com/rust-cross/cargo-xwin/issues/108
+          XWIN_VERSION: "16"
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
@@ -130,9 +134,9 @@ jobs:
           python -m pip install dist/${{ env.PACKAGE_NAME }}-*.whl --force-reinstall
           sg --help
       - name: "Upload wheels"
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: wheels-${{ matrix.platform.target }}
           path: dist
 
   linux:
@@ -151,7 +155,7 @@ jobs:
       - name: "Build wheels"
         uses: PyO3/maturin-action@v1
         env:
-          CFLAGS: "-std=c99"
+          CFLAGS: "-std=c11"
           CXXFLAGS: "-std=c++11"
         with:
           target: ${{ matrix.target }}
@@ -163,9 +167,9 @@ jobs:
           pip install dist/${{ env.PACKAGE_NAME }}-*.whl --force-reinstall
           sg --help
       - name: "Upload wheels"
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: wheels-${{ matrix.target }}
           path: dist
 
   upload-release:
@@ -176,7 +180,7 @@ jobs:
       - macos-x86_64
       - windows
       - linux
-        # - linux-cross I would want to support linux-cross but it is too hard for me to compile c projects for tree-sitter-languages
+      # - linux-cross I would want to support linux-cross but it is too hard for me to compile c projects for tree-sitter-languages
     # If you don't set release flag, it's a dry run (no uploads).
     if: "startsWith(github.event.ref, 'refs/tags') || inputs.need_release"
     environment:
@@ -185,13 +189,18 @@ jobs:
       # For pypi trusted publishing
       id-token: write
     steps:
-      - uses: actions/download-artifact@v3
+      - name: "Install uv"
+        uses: astral-sh/setup-uv@v5
+      - uses: actions/download-artifact@v4
         with:
-          name: wheels
+          pattern: wheels*
+          merge-multiple: true
           path: wheels
       - name: Publish to PyPi
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true
-          packages-dir: wheels
-          verbose: true
+        run: uv publish -v wheels/*
+      # - name: Publish to PyPi
+      #   uses: pypa/gh-action-pypi-publish@release/v1
+      #   with:
+      #     skip-existing: true
+      #     packages-dir: wheels
+      #     verbose: true
