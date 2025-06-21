@@ -43,6 +43,7 @@ fn read_char() -> Result<char> {
   loop {
     if let Event::Key(evt) = event::read()? {
       match evt.code {
+        KeyCode::Tab => break Ok('\t'),
         KeyCode::Enter => break Ok('\n'),
         KeyCode::Char(c) => break Ok(c),
         _ => (),
@@ -63,7 +64,7 @@ fn prompt_reply_stdout(prompt: &str) -> Result<char> {
 }
 
 // clear screen
-fn clear() -> Result<()> {
+pub fn clear() -> Result<()> {
   execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
   Ok(())
   // https://github.com/console-rs/console/blob/be1c2879536c90ffc2b54938b5964084f5fef67d/src/common_term.rs#L56
